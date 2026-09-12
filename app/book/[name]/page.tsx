@@ -404,6 +404,7 @@ const Book = () => {
     const { createWorker, PSM } = await import("tesseract.js");
     const worker = await createWorker(selectedOcrLang.split("+"), 1, {
       langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
+      corePath: "https://unpkg.com/[email protected]/tesseract-core-simd-lstm.wasm.js",
       logger: () => {},
     });
 
