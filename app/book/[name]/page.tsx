@@ -392,40 +392,45 @@ const Book = () => {
   );
 
   const getTesseractWorker = async () => {
-    if (
-      tesseractWorkerRef.current &&
-      activeWorkerLangRef.current === selectedOcrLang
-    ) {
-      return tesseractWorkerRef.current;
-    }
+  if (
+    tesseractWorkerRef.current &&
+    activeWorkerLangRef.current === selectedOcrLang
+  ) {
+    return tesseractWorkerRef.current;
+  }
 
-    if (tesseractWorkerRef.current) {
-      await tesseractWorkerRef.current.terminate();
-    }
+  if (tesseractWorkerRef.current) {
+    await tesseractWorkerRef.current.terminate();
+  }
 
-    const { createWorker, PSM } = await import("tesseract.js");
-    const worker = await createWorker(selectedOcrLang.split("+"), 1, {
-      workerPath: "/tesseract/worker.min.js",
-      // Force the plain SIMD build instead of letting tesseract.js
-      // auto-detect the browser's WASM feature set. Auto-detection was
-      // picking "relaxed SIMD" on some browsers/devices whose runtime
-      // claims to support the feature but doesn't actually implement every
-      // instruction it uses (e.g. DotProductSSE), which aborted mid-OCR
-      // with "missing function: _ZN9tesseract13DotProductSSEEPKfS1_i".
-      // Plain SIMD is far more consistently supported and still fast.
-      corePath: "/tesseract/tesseract-core-simd-lstm.js",
-      langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
-      logger: () => {},
-    });
+  const { createWorker, PSM } = await import("tesseract.js");
 
-    await worker.setParameters({
-      tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
-    });
+  // Self-hosted assets, resolved to absolute URLs on our own origin.
+  const origin = window.location.origin;
 
-    tesseractWorkerRef.current = worker;
-    activeWorkerLangRef.current = selectedOcrLang;
-    return worker;
-  };
+  const worker = await createWorker(selectedOcrLang.split("+"), 1, {
+    workerPath: `${origin}/tesseract/worker.min.js`,
+    corePath: `${origin}/tesseract/tesseract-core-simd-lstm.js`,
+    langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
+    logger: () => {},
+    // Load the worker script directly (new Worker(workerPath)) instead of
+    // fetching it and wrapping it in a blob: URL. The blob-wrapping is only
+    // needed to dodge cross-origin worker restrictions when workerPath
+    // points at a CDN; since we're self-hosting on the same origin, it's
+    // unnecessary — and it was the actual cause of the wasm-resolution
+    // crash, because a worker running from a blob: URL can't correctly
+    // resolve the core.js file's *relative* reference to its own .wasm file.
+    workerBlobURL: false,
+  });
+
+  await worker.setParameters({
+    tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+  });
+
+  tesseractWorkerRef.current = worker;
+  activeWorkerLangRef.current = selectedOcrLang;
+  return worker;
+};
 
   const detectDirection = (str: string): "rtl" | "ltr" => {
     const arabicPattern = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/;
