@@ -81,30 +81,30 @@ const BookCard = ({
     setRename(false);
   };
 
-  const handleDelete = async () => {
-    const confirmed = window.confirm(
-      `Delete "${title}"? This cannot be undone.`
-    );
+  // const handleDelete = async () => {
+  //   const confirmed = window.confirm(
+  //     `Delete "${title}"? This cannot be undone.`
+  //   );
 
-    if (!confirmed) return;
+  //   if (!confirmed) return;
 
-    try {
-      setDeleting(true);
+  //   try {
+  //     setDeleting(true);
 
-      const db = await getDB();
+  //     const db = await getDB();
 
-      await db.delete("books", book.id);
+  //     await db.delete("books", book.id);
 
-      setAllBooks((books) =>
-        books.filter((b) => b.id !== book.id)
-      );
-    } catch (error) {
-      console.error(error);
-      alert("Could not delete book");
-    } finally {
-      setDeleting(false);
-    }
-  };
+  //     setAllBooks((books) =>
+  //       books.filter((b) => b.id !== book.id)
+  //     );
+  //   } catch (error) {
+  //     console.error(error);
+  //     alert("Could not delete book");
+  //   } finally {
+  //     setDeleting(false);
+  //   }
+  // };
 
   const Document = PDFComponents?.Document;
   const Page = PDFComponents?.Page;
@@ -249,7 +249,7 @@ const BookCard = ({
                 ✏️
               </button>
 
-              <button
+              {/* <button
                 onClick={handleDelete}
                 disabled={deleting}
                 className="
@@ -267,7 +267,7 @@ const BookCard = ({
                 title="Delete book"
               >
                 {deleting ? "..." : "🗑️"}
-              </button>
+              </button> */}
             </>
           )}
         </div>
