@@ -20,9 +20,15 @@ interface CachedPageResult {
   direction: "rtl" | "ltr";
 }
 
-interface PageAIData {
-  translation?: string;
-  explanation?: string;
+// Generic map of taskKey -> generated text for a given (page, output-language,
+// book-language) triple. taskKey is "translation", "explanation", or
+// `custom:${promptId}` for a saved custom prompt.
+type PageAIData = Record<string, string>;
+
+interface CustomPrompt {
+  id: string;
+  name: string;
+  prompt: string;
 }
 
 const SUPPORTED_OUTPUT_LANGS = [
@@ -40,6 +46,8 @@ const OCR_LANGUAGE_OPTIONS: { label: string; value: "eng" | "ara" | "eng+ara" }[
   { label: "Arabic", value: "ara" },
   { label: "Arabic + English", value: "eng+ara" },
 ];
+
+const CUSTOM_PROMPTS_STORAGE_KEY = "reader_custom_prompts";
 
 // Safety cap on the AI response size. A well-formed translation/explanation
 // of a single page should never come close to this — if it's exceeded it
@@ -69,13 +77,22 @@ const Book = () => {
 
   // AI & Translation States
   const [outputLanguage, setOutputLanguage] = useState<string>("English");
-  const [translationText, setTranslationText] = useState<string>("");
-  const [explanationText, setExplanationText] = useState<string>("");
+  const [resultText, setResultText] = useState<string>("");
   const [aiLoading, setAiLoading] = useState<boolean>(false);
-  const [activeAITab, setActiveAITab] = useState<"none" | "translation" | "explanation">("none");
+  // "none" | "translation" | "explanation" | `custom:${promptId}`
+  const [activeAITab, setActiveAITab] = useState<string>("none");
+
+  // Custom prompts (persisted to localStorage)
+  const [customPrompts, setCustomPrompts] = useState<CustomPrompt[]>([]);
+  const [showPromptManager, setShowPromptManager] = useState(false);
+  const [showNewPromptForm, setShowNewPromptForm] = useState(false);
+  const [newPromptName, setNewPromptName] = useState("");
+  const [newPromptText, setNewPromptText] = useState("");
 
   // Reading experience states
   const [pdfVisible, setPdfVisible] = useState<boolean>(true);
+  const [pdfZoom, setPdfZoom] = useState<number>(1);
+  const [pdfBaseWidth, setPdfBaseWidth] = useState<number>(320);
   const [continuousMode, setContinuousMode] = useState<boolean>(false);
   const [flipClass, setFlipClass] = useState<string>("");
 
@@ -101,6 +118,11 @@ const Book = () => {
   const isProcessingQueueRef = useRef<boolean>(false);
   const currentPageRef = useRef<number>(currentPage);
   const outputLanguageRef = useRef<string>(outputLanguage);
+  const activeTaskRef = useRef<string>("none");
+  // Holds the raw text of whichever custom prompt is currently active, so
+  // continuous mode / prefetch can re-use it without needing the prompt id
+  // to still exist in `customPrompts` (e.g. right after it's deleted mid-flight).
+  const activeCustomPromptTextRef = useRef<string>("");
   const lastAutoTriggeredRef = useRef<string>("");
   const touchStartXRef = useRef<number | null>(null);
   const flipTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -113,6 +135,8 @@ const Book = () => {
   // scrolled through doesn't leave the next page pre-scrolled down.
   const mainScrollRef = useRef<HTMLElement | null>(null);
   const contentScrollRef = useRef<HTMLDivElement | null>(null);
+  const pdfContainerRef = useRef<HTMLDivElement | null>(null);
+  const promptManagerRef = useRef<HTMLDivElement | null>(null);
 
   // Runs a function after any currently-running OCR job finishes, and blocks
   // any later job until this one is done. This is what stops "switch language
@@ -134,6 +158,10 @@ const Book = () => {
     outputLanguageRef.current = outputLanguage;
   }, [outputLanguage]);
 
+  useEffect(() => {
+    activeTaskRef.current = activeAITab;
+  }, [activeAITab]);
+
   // Reset scroll position whenever the visible page or the active
   // translation/explanation tab changes, so the reader always starts each
   // page at the top instead of wherever the previous page left off.
@@ -148,7 +176,7 @@ const Book = () => {
     setMobileMenuOpen(false);
   }, [currentPage]);
 
-  // Load saved preferences
+  // Load saved preferences + saved custom prompts
   useEffect(() => {
     const savedLang = localStorage.getItem("reader_preferred_output_lang");
     if (savedLang && SUPPORTED_OUTPUT_LANGS.includes(savedLang)) {
@@ -158,7 +186,47 @@ const Book = () => {
     if (savedContinuous === "1") setContinuousMode(true);
     const savedPdfVisible = localStorage.getItem("reader_pdf_visible");
     if (savedPdfVisible === "0") setPdfVisible(false);
+
+    try {
+      const rawPrompts = localStorage.getItem(CUSTOM_PROMPTS_STORAGE_KEY);
+      if (rawPrompts) {
+        const parsed = JSON.parse(rawPrompts);
+        if (Array.isArray(parsed)) setCustomPrompts(parsed);
+      }
+    } catch (err) {
+      console.warn("Could not load saved custom prompts", err);
+    }
   }, []);
+
+  // Close the custom-prompt dropdown when clicking outside it.
+  useEffect(() => {
+    if (!showPromptManager) return;
+    const handleClick = (e: MouseEvent) => {
+      if (promptManagerRef.current && !promptManagerRef.current.contains(e.target as Node)) {
+        setShowPromptManager(false);
+        setShowNewPromptForm(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showPromptManager]);
+
+  // Keep the PDF page's render width in sync with however much horizontal
+  // space its container actually has — this is what makes the viewer usable
+  // instead of a fixed tiny thumbnail, on both phones and desktop.
+  useEffect(() => {
+    const el = pdfContainerRef.current;
+    if (!el || !pdfVisible) return;
+
+    const updateWidth = () => {
+      setPdfBaseWidth(Math.max(el.clientWidth - 16, 120));
+    };
+    updateWidth();
+
+    const ro = new ResizeObserver(updateWidth);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [pdfVisible]);
 
   const handleLanguageChange = (newLang: string) => {
     setOutputLanguage(newLang);
@@ -180,6 +248,51 @@ const Book = () => {
       return next;
     });
   };
+
+  const persistCustomPrompts = (list: CustomPrompt[]) => {
+    setCustomPrompts(list);
+    try {
+      localStorage.setItem(CUSTOM_PROMPTS_STORAGE_KEY, JSON.stringify(list));
+    } catch (err) {
+      console.warn("Could not save custom prompts", err);
+    }
+  };
+
+  const addCustomPrompt = () => {
+    const name = newPromptName.trim();
+    const text = newPromptText.trim();
+    if (!name || !text) return;
+
+    const newPrompt: CustomPrompt = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      prompt: text,
+    };
+
+    persistCustomPrompts([...customPrompts, newPrompt]);
+    setNewPromptName("");
+    setNewPromptText("");
+    setShowNewPromptForm(false);
+  };
+
+  const deleteCustomPrompt = (id: string) => {
+    persistCustomPrompts(customPrompts.filter((p) => p.id !== id));
+    if (activeAITab === `custom:${id}`) {
+      setActiveAITab("none");
+      setResultText("");
+      activeCustomPromptTextRef.current = "";
+    }
+  };
+
+  const getTaskLabel = useCallback(
+    (taskKey: string): string => {
+      if (taskKey === "translation") return "Translation";
+      if (taskKey === "explanation") return "Explanation";
+      const id = taskKey.startsWith("custom:") ? taskKey.slice("custom:".length) : "";
+      return customPrompts.find((p) => p.id === id)?.name || "Custom";
+    },
+    [customPrompts]
+  );
 
   // Aborts whatever translation/explanation fetch is currently in flight for
   // the visible page. Called whenever the reader navigates away (prev/next/
@@ -249,7 +362,10 @@ const Book = () => {
     loadBook();
   }, [params.name]);
 
-  // IndexedDB / LocalStorage Multi-Language AI Cache Helpers
+  // IndexedDB / LocalStorage Multi-Language AI Cache Helpers.
+  // Each (page, outputLanguage, bookLanguage) key stores a PageAIData map of
+  // taskKey -> generated text, so translation/explanation/every custom
+  // prompt's result for that page+language all live in one record.
   const getAIStorageKey = useCallback(
     (pageNum: number, lang: string) =>
       `page_ai_${book?.name || "book"}_p${pageNum}_${lang}_${selectedOcrLang}`,
@@ -301,9 +417,11 @@ const Book = () => {
     [getAIStorageKey]
   );
 
-  // Wipes every language's translation/explanation cached for a page under
-  // the current book (OCR) language — used when the reader manually refreshes
-  // a page so stale AI output from a bad extraction can't linger.
+  // Wipes every language's translation/explanation/custom-prompt cache for a
+  // page under the current book (OCR) language — used when the reader
+  // manually refreshes a page so stale AI output from a bad extraction can't
+  // linger. Since every task for a given (page, lang) lives in one record,
+  // this doesn't need to know which task keys exist.
   const clearCachedAIDataForPage = useCallback(
     async (pageNum: number) => {
       let db: Awaited<ReturnType<typeof getDB>> | null = null;
@@ -330,17 +448,19 @@ const Book = () => {
     [getAIStorageKey]
   );
 
-  // Synchronize AI State on Page / Language change
+  // Synchronize AI State on Page / Language / Tab change
   useEffect(() => {
     const syncAICache = async () => {
-      if (!book) return;
+      if (!book || activeAITab === "none") {
+        setResultText("");
+        return;
+      }
       const cached = await getCachedAIData(currentPage, outputLanguage);
-      setTranslationText(cached?.translation || "");
-      setExplanationText(cached?.explanation || "");
+      setResultText(cached?.[activeAITab] || "");
     };
 
     syncAICache();
-  }, [currentPage, outputLanguage, book, getCachedAIData]);
+  }, [currentPage, outputLanguage, activeAITab, book, getCachedAIData]);
 
   // Page extraction (OCR / native text) cache — backed by IndexedDB, with
   // localStorage as a fallback if the "page_extractions" store isn't available.
@@ -700,15 +820,61 @@ const Book = () => {
     return match ? match[1].trim() : raw.trim();
   };
 
-  // Silently prepares translation/explanation for an upcoming page so it's
-  // instantly ready by the time the reader turns to it. Never touches the
-  // visible AI state — it only warms the IndexedDB cache.
+  // Builds the prompt sent to the AI endpoint for a given task. "translation"
+  // and "explanation" use their fixed templates; anything else is treated as
+  // a saved custom prompt and `customText` (the user's own instructions) is
+  // spliced in ahead of the page content.
+  const buildPrompt = (
+    taskKey: string,
+    lang: string,
+    text: string,
+    previousPageContext: string,
+    customText?: string
+  ): string => {
+    if (taskKey === "translation") {
+      return `Translate the following text accurately into ${lang}.
+Preserve the meaning and important context.
+Automatically detect the source language.
+Return ONLY the result inside <artifact></artifact> tags.
+
+--- SOURCE TEXT ---
+${text}`;
+    }
+
+    if (taskKey === "explanation") {
+      return `Explain the following book content clearly in ${lang}.
+${previousPageContext ? "Use the previous page context to understand continuation." : ""}
+Automatically detect the source language.
+Return ONLY the explanation inside <artifact></artifact> tags.
+
+${previousPageContext}
+
+--- CURRENT PAGE CONTENT ---
+${text}`;
+    }
+
+    // Custom prompt
+    return `${customText || "Analyze the following page."}
+${lang !== "Same as original" ? `Respond in ${lang}.` : ""}
+${previousPageContext ? "Use the previous page context to understand continuation." : ""}
+Automatically detect the source language of the material.
+Return ONLY the result inside <artifact></artifact> tags.
+
+${previousPageContext}
+
+--- CURRENT PAGE CONTENT ---
+${text}`;
+  };
+
+  // Silently prepares a task's result for an upcoming page so it's instantly
+  // ready by the time the reader turns to it. Never touches the visible AI
+  // state — it only warms the IndexedDB cache.
   const prefetchAIForPage = useCallback(
-    async (pageNum: number, task: "translation" | "explanation", lang: string) => {
+    async (pageNum: number, taskKey: string, lang: string, customText?: string) => {
       if (pageNum < 1 || pageNum > numPages || !pdfDocProxy) return;
 
       const existingAI = await getCachedAIData(pageNum, lang);
-      if (existingAI?.[task]) return;
+      if (existingAI?.[taskKey]) return;
 
       let extraction = await getCachedData(pageNum);
       if (!extraction) {
@@ -722,31 +888,14 @@ const Book = () => {
       if (!extraction || !extraction.text.trim()) return;
 
       let previousPageContext = "";
-      if (task === "explanation" && pageNum > 1) {
+      if (taskKey !== "translation" && pageNum > 1) {
         const prevData = await getCachedData(pageNum - 1);
         if (prevData?.text) {
           previousPageContext = `\n--- PREVIOUS PAGE CONTEXT ---\n${prevData.text.slice(-500)}`;
         }
       }
 
-      const prompt =
-        task === "translation"
-          ? `Translate the following text accurately into ${lang}.
-Preserve the meaning and important context.
-Automatically detect the source language.
-Return ONLY the result inside <artifact></artifact> tags.
-
---- SOURCE TEXT ---
-${extraction.text}`
-          : `Explain the following book content clearly in ${lang}.
-${previousPageContext ? "Use the previous page context to understand continuation." : ""}
-Automatically detect the source language.
-Return ONLY the explanation inside <artifact></artifact> tags.
-
-${previousPageContext}
-
---- CURRENT PAGE CONTENT ---
-${extraction.text}`;
+      const prompt = buildPrompt(taskKey, lang, extraction.text, previousPageContext, customText);
 
       try {
         const res = await fetch("/api/ai", {
@@ -765,7 +914,7 @@ ${extraction.text}`;
         }
 
         const currentData = (await getCachedAIData(pageNum, lang)) || {};
-        await setCachedAIData(pageNum, lang, { ...currentData, [task]: cleanContent });
+        await setCachedAIData(pageNum, lang, { ...currentData, [taskKey]: cleanContent });
       } catch (err) {
         console.warn("Background AI prefetch failed for page", pageNum, err);
       }
@@ -773,35 +922,37 @@ ${extraction.text}`;
     [numPages, pdfDocProxy, getCachedAIData, setCachedAIData, getCachedData]
   );
 
-  // AI Task Handler (Translate & Explain)
+  // AI Task Handler (Translate / Explain / any saved custom prompt)
   const handleAITask = useCallback(
-    async (task: "translation" | "explanation") => {
+    async (taskKey: string, customText?: string) => {
       if (!ocrText.trim()) return;
 
       // Snapshot what this specific request is "for" — if the reader has
-      // moved to a different page or language by the time it resolves, we
-      // must not paint this result over whatever is now on screen.
+      // moved to a different page, language, or task by the time it
+      // resolves, we must not paint this result over whatever is now on screen.
       const requestPage = currentPage;
       const requestLang = outputLanguage;
       const requestText = ocrText;
+      const requestCustomText =
+        customText ?? (taskKey.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined);
       const isStillRelevant = () =>
-        currentPageRef.current === requestPage && outputLanguageRef.current === requestLang;
+        currentPageRef.current === requestPage &&
+        outputLanguageRef.current === requestLang &&
+        activeTaskRef.current === taskKey;
 
-      setActiveAITab(task);
+      setActiveAITab(taskKey);
+      activeTaskRef.current = taskKey;
+      if (requestCustomText !== undefined) activeCustomPromptTextRef.current = requestCustomText;
 
       // Whenever the reader asks for a page, warm up the next two pages in the
       // background so there's no wait when they turn forward.
-      prefetchAIForPage(requestPage + 1, task, requestLang);
-      prefetchAIForPage(requestPage + 2, task, requestLang);
+      prefetchAIForPage(requestPage + 1, taskKey, requestLang, requestCustomText);
+      prefetchAIForPage(requestPage + 2, taskKey, requestLang, requestCustomText);
 
       // 1. Check if already stored in cache
       const existingCache = await getCachedAIData(requestPage, requestLang);
-      if (task === "translation" && existingCache?.translation) {
-        if (isStillRelevant()) setTranslationText(existingCache.translation);
-        return;
-      }
-      if (task === "explanation" && existingCache?.explanation) {
-        if (isStillRelevant()) setExplanationText(existingCache.explanation);
+      if (existingCache?.[taskKey]) {
+        if (isStillRelevant()) setResultText(existingCache[taskKey]);
         return;
       }
 
@@ -816,33 +967,16 @@ ${extraction.text}`;
       if (isStillRelevant()) setAiLoading(true);
 
       try {
-        // Fetch previous page context if generating an explanation
+        // Fetch previous page context for explanation and custom prompts.
         let previousPageContext = "";
-        if (task === "explanation" && requestPage > 1) {
+        if (taskKey !== "translation" && requestPage > 1) {
           const prevPageData = await getCachedData(requestPage - 1);
           if (prevPageData?.text) {
             previousPageContext = `\n--- PREVIOUS PAGE CONTEXT ---\n${prevPageData.text.slice(-500)}`;
           }
         }
 
-        const prompt =
-          task === "translation"
-            ? `Translate the following text accurately into ${requestLang}.
-Preserve the meaning and important context.
-Automatically detect the source language.
-Return ONLY the result inside <artifact></artifact> tags.
-
---- SOURCE TEXT ---
-${requestText}`
-            : `Explain the following book content clearly in ${requestLang}.
-${previousPageContext ? "Use the previous page context to understand continuation." : ""}
-Automatically detect the source language.
-Return ONLY the explanation inside <artifact></artifact> tags.
-
-${previousPageContext}
-
---- CURRENT PAGE CONTENT ---
-${requestText}`;
+        const prompt = buildPrompt(taskKey, requestLang, requestText, previousPageContext, requestCustomText);
 
         // Call your backend AI endpoint
         const res = await fetch("/api/ai", {
@@ -861,33 +995,26 @@ ${requestText}`;
           // Runaway response — surface it as an error and skip caching it,
           // rather than rendering (or persisting) a broken result.
           if (isStillRelevant()) {
-            const overLimitMessage = `Max tokens used — response exceeded ${MAX_RESPONSE_WORD_COUNT.toLocaleString()} words.`;
-            if (task === "translation") {
-              setTranslationText(overLimitMessage);
-            } else {
-              setExplanationText(overLimitMessage);
-            }
+            setResultText(
+              `Max tokens used — response exceeded ${MAX_RESPONSE_WORD_COUNT.toLocaleString()} words.`
+            );
           }
           return;
         }
 
-        // Save updated result in multi-language storage — this always
-        // happens, regardless of whether the reader has since moved on, so
-        // the cache is correct next time they land on this page.
+        // Save updated result in multi-task storage — this always happens,
+        // regardless of whether the reader has since moved on, so the cache
+        // is correct next time they land on this page.
         const currentData = (await getCachedAIData(requestPage, requestLang)) || {};
         const updatedData: PageAIData = {
           ...currentData,
-          [task]: cleanContent,
+          [taskKey]: cleanContent,
         };
 
         await setCachedAIData(requestPage, requestLang, updatedData);
 
         if (isStillRelevant()) {
-          if (task === "translation") {
-            setTranslationText(cleanContent);
-          } else {
-            setExplanationText(cleanContent);
-          }
+          setResultText(cleanContent);
         }
       } catch (err: any) {
         if (err?.name === "AbortError") {
@@ -896,11 +1023,7 @@ ${requestText}`;
         }
         console.error(err);
         if (isStillRelevant()) {
-          if (task === "translation") {
-            setTranslationText("Translation failed. Please try again.");
-          } else {
-            setExplanationText("Explanation failed. Please try again.");
-          }
+          setResultText(`${getTaskLabel(taskKey)} failed. Please try again.`);
         }
       } finally {
         // Only the request that's still the "current" one gets to clear the
@@ -913,11 +1036,21 @@ ${requestText}`;
         if (stillCurrent && isStillRelevant()) setAiLoading(false);
       }
     },
-    [ocrText, currentPage, outputLanguage, getCachedAIData, setCachedAIData, getCachedData, prefetchAIForPage]
+    [
+      ocrText,
+      currentPage,
+      outputLanguage,
+      getCachedAIData,
+      setCachedAIData,
+      getCachedData,
+      prefetchAIForPage,
+      getTaskLabel,
+    ]
   );
 
   // Continuous mode: once turned on, keeps generating the same task
-  // (translation or explanation) automatically as the reader turns pages.
+  // (translation / explanation / custom prompt) automatically as the reader
+  // turns pages.
   useEffect(() => {
     if (!continuousMode || activeAITab === "none") return;
     if (!ocrText.trim()) return;
@@ -926,7 +1059,10 @@ ${requestText}`;
     if (lastAutoTriggeredRef.current === key) return;
     lastAutoTriggeredRef.current = key;
 
-    handleAITask(activeAITab);
+    handleAITask(
+      activeAITab,
+      activeAITab.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined
+    );
   }, [continuousMode, currentPage, ocrText, activeAITab, outputLanguage, handleAITask]);
 
   const handleDocumentLoad = (pdf: any) => {
@@ -1002,10 +1138,10 @@ ${requestText}`;
   };
 
   // Deletes the book row itself plus every cached page-extraction and
-  // AI translation/explanation entry across all OCR languages and all
-  // output languages, then returns to the library. Uses book.numPages
-  // (persisted at add-time) rather than the in-memory numPages state so
-  // deletion is thorough even if the PDF hasn't finished loading yet.
+  // AI translation/explanation/custom-prompt entry across all OCR languages
+  // and all output languages, then returns to the library. Uses
+  // book.numPages (persisted at add-time) rather than the in-memory numPages
+  // state so deletion is thorough even if the PDF hasn't finished loading yet.
   const handleDeleteBookForever = useCallback(async () => {
     if (!book || deleting) return;
 
@@ -1071,8 +1207,7 @@ ${requestText}`;
     cancelOngoingAIRequest();
     await clearCachedData(currentPage);
     await clearCachedAIDataForPage(currentPage);
-    setTranslationText("");
-    setExplanationText("");
+    setResultText("");
     setActiveAITab("none");
     loadActivePageText(currentPage);
   }, [cancelOngoingAIRequest, clearCachedData, clearCachedAIDataForPage, currentPage, loadActivePageText]);
@@ -1082,7 +1217,7 @@ ${requestText}`;
 
   if (error) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#f5f1e8] text-stone-600">
+      <div className="flex min-h-screen items-center justify-center bg-orange-50 text-stone-600">
         {error}
       </div>
     );
@@ -1090,7 +1225,7 @@ ${requestText}`;
 
   if (!book) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#f5f1e8] text-stone-500">
+      <div className="flex min-h-screen items-center justify-center bg-orange-50 text-stone-500">
         Loading book...
       </div>
     );
@@ -1098,23 +1233,21 @@ ${requestText}`;
 
   if (!Document || !Page) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#f5f1e8] text-stone-500">
+      <div className="flex min-h-screen items-center justify-center bg-orange-50 text-stone-500">
         Loading PDF reader...
       </div>
     );
   }
 
-  const displayedText = activeAITab === "translation" ? translationText : explanationText;
-
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-[#f5f1e8]">
+    <div className="flex h-[100dvh] flex-col overflow-hidden bg-orange-50">
 
       {/* Header / toolbar — fixed-height, always visible, never scrolls away.
           On phones this collapses to Back + title + a hamburger; on sm+
           screens the full control row shows inline like before. */}
-      <header className="z-20 flex-shrink-0 border-b border-stone-200 bg-[#faf7f0]/95 backdrop-blur">
+      <header className="z-20 flex-shrink-0 border-b border-orange-200 bg-orange-50/95 backdrop-blur">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-2 px-3 py-2 sm:px-4 sm:py-2.5">
-          <Link href="/" className="shrink-0 text-sm font-semibold text-stone-700 sm:text-base">
+          <Link href="/" className="shrink-0 text-sm font-semibold text-orange-800 sm:text-base">
             ← Back
           </Link>
 
@@ -1134,7 +1267,7 @@ ${requestText}`;
                 onChange={(e) =>
                   setSelectedOcrLang(e.target.value as "eng" | "ara" | "eng+ara")
                 }
-                className="rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                className="rounded-lg border border-orange-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-orange-600"
                 title="The language this book is written in — used when a page needs OCR"
               >
                 {OCR_LANGUAGE_OPTIONS.map((opt) => (
@@ -1153,7 +1286,7 @@ ${requestText}`;
                 id="output-lang"
                 value={outputLanguage}
                 onChange={(e) => handleLanguageChange(e.target.value)}
-                className="rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                className="rounded-lg border border-orange-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-orange-600"
               >
                 {SUPPORTED_OUTPUT_LANGS.map((lang) => (
                   <option key={lang} value={lang}>
@@ -1167,8 +1300,8 @@ ${requestText}`;
               onClick={toggleContinuousMode}
               className={`rounded-lg px-3 py-1.5 text-sm font-medium shadow-sm transition ${
                 continuousMode
-                  ? "bg-teal-700 text-white"
-                  : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                  ? "bg-orange-700 text-white"
+                  : "bg-orange-100 text-orange-800 hover:bg-orange-200"
               }`}
               title="Automatically keep translating/explaining as you turn pages"
             >
@@ -1177,7 +1310,7 @@ ${requestText}`;
 
             <button
               onClick={togglePdfVisible}
-              className="rounded-lg bg-stone-100 px-3 py-1.5 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-200"
+              className="rounded-lg bg-orange-100 px-3 py-1.5 text-sm font-medium text-orange-800 shadow-sm hover:bg-orange-200"
               title="Show or hide the original page image"
             >
               {pdfVisible ? "Hide page" : "Show page"}
@@ -1186,7 +1319,7 @@ ${requestText}`;
             <button
               onClick={handleRefreshPage}
               disabled={ocrLoading}
-              className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-sm font-medium text-stone-600 shadow-sm hover:bg-stone-200 disabled:opacity-50"
+              className="rounded-lg bg-orange-100 px-2.5 py-1.5 text-sm font-medium text-orange-700 shadow-sm hover:bg-orange-200 disabled:opacity-50"
               title="Re-extract this page's text and clear any cached translation/explanation for it"
             >
               ↻
@@ -1205,7 +1338,7 @@ ${requestText}`;
           {/* Mobile hamburger — hidden on sm+ */}
           <button
             onClick={() => setMobileMenuOpen((v) => !v)}
-            className="flex shrink-0 items-center justify-center rounded-lg bg-stone-100 p-2 text-stone-700 shadow-sm sm:hidden"
+            className="flex shrink-0 items-center justify-center rounded-lg bg-orange-100 p-2 text-orange-800 shadow-sm sm:hidden"
             aria-label="Menu"
             aria-expanded={mobileMenuOpen}
           >
@@ -1231,7 +1364,7 @@ ${requestText}`;
 
         {/* Mobile dropdown panel — all the same controls, stacked */}
         {mobileMenuOpen && (
-          <div className="border-t border-stone-200 bg-[#faf7f0] px-4 py-3 sm:hidden">
+          <div className="border-t border-orange-200 bg-orange-50 px-4 py-3 sm:hidden">
             <div className="flex flex-col gap-3">
               <div className="flex gap-2">
                 <div className="flex flex-1 flex-col gap-0.5">
@@ -1244,7 +1377,7 @@ ${requestText}`;
                     onChange={(e) =>
                       setSelectedOcrLang(e.target.value as "eng" | "ara" | "eng+ara")
                     }
-                    className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                    className="w-full rounded-lg border border-orange-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-orange-600"
                   >
                     {OCR_LANGUAGE_OPTIONS.map((opt) => (
                       <option key={opt.value} value={opt.value}>
@@ -1262,7 +1395,7 @@ ${requestText}`;
                     id="output-lang-m"
                     value={outputLanguage}
                     onChange={(e) => handleLanguageChange(e.target.value)}
-                    className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                    className="w-full rounded-lg border border-orange-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-orange-600"
                   >
                     {SUPPORTED_OUTPUT_LANGS.map((lang) => (
                       <option key={lang} value={lang}>
@@ -1278,8 +1411,8 @@ ${requestText}`;
                   onClick={toggleContinuousMode}
                   className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium shadow-sm transition ${
                     continuousMode
-                      ? "bg-teal-700 text-white"
-                      : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                      ? "bg-orange-700 text-white"
+                      : "bg-orange-100 text-orange-800 hover:bg-orange-200"
                   }`}
                 >
                   {continuousMode ? "⏸ Continuous on" : "▶ Continuous"}
@@ -1287,7 +1420,7 @@ ${requestText}`;
 
                 <button
                   onClick={togglePdfVisible}
-                  className="flex-1 rounded-lg bg-stone-100 px-3 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-200"
+                  className="flex-1 rounded-lg bg-orange-100 px-3 py-2 text-sm font-medium text-orange-800 shadow-sm hover:bg-orange-200"
                 >
                   {pdfVisible ? "Hide page" : "Show page"}
                 </button>
@@ -1297,7 +1430,7 @@ ${requestText}`;
                 <button
                   onClick={handleRefreshPage}
                   disabled={ocrLoading}
-                  className="flex-1 rounded-lg bg-stone-100 px-3 py-2 text-sm font-medium text-stone-600 shadow-sm hover:bg-stone-200 disabled:opacity-50"
+                  className="flex-1 rounded-lg bg-orange-100 px-3 py-2 text-sm font-medium text-orange-700 shadow-sm hover:bg-orange-200 disabled:opacity-50"
                 >
                   ↻ Refresh page
                 </button>
@@ -1320,59 +1453,89 @@ ${requestText}`;
           header and bottom nav are always fully visible. */}
       <main
         ref={mainScrollRef as any}
-        className="mx-auto flex w-full min-h-0 max-w-3xl flex-1 flex-col overflow-y-auto px-3 pt-2 sm:px-4 sm:pt-3"
+        className="mx-auto flex w-full min-h-0 max-w-4xl flex-1 flex-col overflow-y-auto px-3 pt-2 sm:px-4 sm:pt-3"
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
-        {/* Collapsible original page preview — small by default, fully hideable */}
-        <div
-          className={`flex-shrink-0 overflow-hidden transition-all duration-300 ease-in-out ${
-            pdfVisible ? "mb-2 max-h-[26vh] opacity-100 sm:mb-3 sm:max-h-[38vh]" : "mb-0 max-h-0 opacity-0"
-          }`}
-        >
-          <div className="mx-auto w-full max-w-[160px] rounded-xl border border-stone-200 bg-white p-1.5 shadow-sm sm:max-w-[260px] sm:p-2">
-            <Document
-              file={book.file}
-              onLoadSuccess={handleDocumentLoad}
-              loading={<div className="p-6 text-center text-xs text-stone-400">Loading PDF…</div>}
-              error={<div className="p-6 text-center text-xs text-red-400">Could not load PDF</div>}
-            >
-              <Page
-                pageNumber={currentPage}
-                width={240}
-                renderTextLayer={false}
-                renderAnnotationLayer={false}
-              />
-            </Document>
-            {currentExtractionType && (
-              <div className="mt-1 flex justify-center">
-                <span
-                  className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                    currentExtractionType === "pdf-text"
-                      ? "bg-emerald-50 text-emerald-700"
-                      : "bg-violet-50 text-violet-700"
-                  }`}
+        {/* Original page viewer — a proper, readable PDF pane (not a
+            thumbnail): zoomable, scrollable in both directions, and takes a
+            real chunk of the screen. Sits on top; the translation/explanation
+            panel below is the "normal reader" split underneath it. */}
+        {pdfVisible && (
+          <div className="mb-2 flex-shrink-0 sm:mb-3">
+            <div className="mb-1 flex items-center justify-between px-1">
+              <span className="text-[11px] font-semibold text-orange-800">
+                Original page
+                {currentExtractionType && (
+                  <span
+                    className={`ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                      currentExtractionType === "pdf-text"
+                        ? "bg-emerald-50 text-emerald-700"
+                        : "bg-violet-50 text-violet-700"
+                    }`}
+                  >
+                    {currentExtractionType === "pdf-text" ? "Direct text" : "OCR"}
+                  </span>
+                )}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setPdfZoom((z) => Math.max(0.5, +(z - 0.15).toFixed(2)))}
+                  className="rounded-md bg-orange-100 px-2 py-0.5 text-sm font-semibold text-orange-800 hover:bg-orange-200"
+                  aria-label="Zoom out"
                 >
-                  {currentExtractionType === "pdf-text" ? "Direct text" : "OCR"}
+                  −
+                </button>
+                <span className="w-10 text-center text-[11px] text-stone-500">
+                  {Math.round(pdfZoom * 100)}%
                 </span>
+                <button
+                  onClick={() => setPdfZoom((z) => Math.min(3, +(z + 0.15).toFixed(2)))}
+                  className="rounded-md bg-orange-100 px-2 py-0.5 text-sm font-semibold text-orange-800 hover:bg-orange-200"
+                  aria-label="Zoom in"
+                >
+                  +
+                </button>
               </div>
-            )}
-          </div>
-        </div>
+            </div>
 
-        {/* The "book page" — translation / explanation reading surface.
-            This flexes to fill the remaining height and only its inner text
-            area scrolls, so the toolbar/tabs stay pinned in view. */}
+            <div
+              ref={pdfContainerRef}
+              className="h-[40vh] w-full overflow-auto rounded-xl border border-orange-200 bg-white p-2 shadow-sm sm:h-[46vh]"
+            >
+              <div className="flex min-h-full items-start justify-center">
+                <Document
+                  file={book.file}
+                  onLoadSuccess={handleDocumentLoad}
+                  loading={<div className="p-6 text-center text-xs text-stone-400">Loading PDF…</div>}
+                  error={<div className="p-6 text-center text-xs text-red-400">Could not load PDF</div>}
+                >
+                  <Page
+                    pageNumber={currentPage}
+                    width={Math.max(pdfBaseWidth * pdfZoom, 100)}
+                    renderTextLayer={false}
+                    renderAnnotationLayer={false}
+                  />
+                </Document>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* The "book page" — translation / explanation / custom-prompt
+            reading surface. This flexes to fill the remaining height and
+            only its inner text area scrolls, so the toolbar/tabs stay
+            pinned in view. */}
         <div className={`page-stage flex min-h-0 flex-1 flex-col pb-2 sm:pb-3 ${flipClass}`}>
-          <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-stone-200 bg-[#fffdf7] p-3 shadow-md sm:p-8">
-            <div className="mb-2 flex flex-shrink-0 items-center gap-2 border-b border-stone-200 pb-2 sm:mb-4 sm:pb-3">
+          <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-orange-200 bg-white p-3 shadow-md sm:p-8">
+            <div className="mb-2 flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-orange-100 pb-2 sm:mb-4 sm:pb-3">
               <button
                 onClick={() => handleAITask("translation")}
                 disabled={aiLoading || !ocrText}
                 className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
                   activeAITab === "translation"
-                    ? "bg-teal-700 text-white shadow-sm"
-                    : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                    ? "bg-orange-600 text-white shadow-sm"
+                    : "bg-orange-50 text-orange-800 hover:bg-orange-100"
                 }`}
               >
                 Translation
@@ -1382,13 +1545,110 @@ ${requestText}`;
                 disabled={aiLoading || !ocrText}
                 className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
                   activeAITab === "explanation"
-                    ? "bg-amber-700 text-white shadow-sm"
-                    : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                    ? "bg-amber-600 text-white shadow-sm"
+                    : "bg-orange-50 text-orange-800 hover:bg-orange-100"
                 }`}
               >
                 Explanation
               </button>
-              <span className="ml-auto whitespace-nowrap rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 text-[10px] font-medium text-stone-500 sm:px-2.5 sm:text-xs">
+
+              {/* Custom prompt picker: saved prompts loaded from & written to
+                  localStorage, with delete support. */}
+              <div className="relative" ref={promptManagerRef}>
+                <button
+                  onClick={() => setShowPromptManager((v) => !v)}
+                  disabled={aiLoading || !ocrText}
+                  className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
+                    activeAITab.startsWith("custom:")
+                      ? "bg-orange-800 text-white shadow-sm"
+                      : "bg-orange-50 text-orange-800 hover:bg-orange-100"
+                  }`}
+                >
+                  {activeAITab.startsWith("custom:") ? `✨ ${getTaskLabel(activeAITab)}` : "✨ Custom"}
+                </button>
+
+                {showPromptManager && (
+                  <div className="absolute left-0 top-full z-40 mt-1 w-64 rounded-xl border border-orange-200 bg-white p-2 shadow-lg">
+                    {customPrompts.length === 0 && !showNewPromptForm && (
+                      <p className="px-1 py-2 text-xs text-stone-400">No saved prompts yet.</p>
+                    )}
+
+                    <div className="max-h-40 overflow-y-auto">
+                      {customPrompts.map((p) => (
+                        <div
+                          key={p.id}
+                          className="flex items-center gap-1 rounded-lg px-1 py-1 hover:bg-orange-50"
+                        >
+                          <button
+                            onClick={() => {
+                              activeCustomPromptTextRef.current = p.prompt;
+                              setShowPromptManager(false);
+                              handleAITask(`custom:${p.id}`, p.prompt);
+                            }}
+                            className="flex-1 truncate text-left text-xs font-medium text-stone-700"
+                            title={p.prompt}
+                          >
+                            {p.name}
+                          </button>
+                          <button
+                            onClick={() => deleteCustomPrompt(p.id)}
+                            className="rounded px-1.5 py-0.5 text-xs text-red-500 hover:bg-red-50"
+                            title="Delete this prompt"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {showNewPromptForm ? (
+                      <div className="mt-2 space-y-1 border-t border-orange-100 pt-2">
+                        <input
+                          value={newPromptName}
+                          onChange={(e) => setNewPromptName(e.target.value)}
+                          placeholder="Prompt name"
+                          className="w-full rounded-lg border border-orange-200 px-2 py-1 text-xs outline-none focus:border-orange-600"
+                        />
+                        <textarea
+                          value={newPromptText}
+                          onChange={(e) => setNewPromptText(e.target.value)}
+                          placeholder="e.g. Summarize this page in 3 bullet points"
+                          rows={3}
+                          className="w-full rounded-lg border border-orange-200 px-2 py-1 text-xs outline-none focus:border-orange-600"
+                        />
+                        <div className="flex gap-1">
+                          <button
+                            onClick={addCustomPrompt}
+                            disabled={!newPromptName.trim() || !newPromptText.trim()}
+                            className="flex-1 rounded-lg bg-orange-600 px-2 py-1 text-xs font-medium text-white hover:bg-orange-700 disabled:opacity-40"
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={() => {
+                              setShowNewPromptForm(false);
+                              setNewPromptName("");
+                              setNewPromptText("");
+                            }}
+                            className="flex-1 rounded-lg bg-orange-50 px-2 py-1 text-xs font-medium text-orange-800 hover:bg-orange-100"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setShowNewPromptForm(true)}
+                        className="mt-1 w-full rounded-lg border border-dashed border-orange-300 px-2 py-1.5 text-xs font-medium text-orange-600 hover:bg-orange-50"
+                      >
+                        + New custom prompt
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <span className="ml-auto whitespace-nowrap rounded-full border border-orange-200 bg-orange-50 px-2 py-0.5 text-[10px] font-medium text-orange-700 sm:px-2.5 sm:text-xs">
                 {outputLanguage} · p.{currentPage}
               </span>
             </div>
@@ -1400,18 +1660,18 @@ ${requestText}`;
                 </p>
               ) : activeAITab === "none" ? (
                 <p className="py-10 text-center text-sm text-stone-400">
-                  Choose Translation or Explanation above to start reading this page.
+                  Choose Translation, Explanation, or a custom prompt above to start reading this page.
                 </p>
               ) : aiLoading ? (
                 <p className="animate-pulse py-10 text-center text-sm text-stone-400">
-                  {activeAITab === "translation" ? "Translating" : "Explaining"} into {outputLanguage}…
+                  Generating {getTaskLabel(activeAITab)} in {outputLanguage}…
                 </p>
               ) : (
                 <p
-                  dir={detectDirection(displayedText)}
+                  dir={detectDirection(resultText)}
                   className="whitespace-pre-wrap break-words font-serif text-base leading-7 text-stone-800 sm:text-xl sm:leading-9"
                 >
-                  {displayedText || "Nothing generated for this page yet."}
+                  {resultText || "Nothing generated for this page yet."}
                 </p>
               )}
             </div>
@@ -1420,12 +1680,12 @@ ${requestText}`;
       </main>
 
       {/* Bottom navigation — normal flow, fixed height, always visible without scrolling */}
-      <nav className="z-30 flex-shrink-0 border-t border-stone-200 bg-[#faf7f0]/95 px-4 pb-[calc(env(safe-area-inset-bottom)+0.6rem)] pt-2.5 shadow-[0_-4px_16px_rgba(0,0,0,0.06)] backdrop-blur">
+      <nav className="z-30 flex-shrink-0 border-t border-orange-200 bg-orange-50/95 px-4 pb-[calc(env(safe-area-inset-bottom)+0.6rem)] pt-2.5 shadow-[0_-4px_16px_rgba(0,0,0,0.06)] backdrop-blur">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
           <button
             onClick={previousPage}
             disabled={currentPage === 1}
-            className="rounded-full bg-stone-100 p-3 text-lg leading-none text-stone-700 hover:bg-stone-200 disabled:opacity-30"
+            className="rounded-full bg-orange-100 p-3 text-lg leading-none text-orange-800 hover:bg-orange-200 disabled:opacity-30"
             aria-label="Previous page"
           >
             ←
@@ -1442,7 +1702,7 @@ ${requestText}`;
               onKeyDown={(e) => {
                 if (e.key === "Enter") goToPage();
               }}
-              className="w-14 rounded-lg border border-stone-300 bg-white px-2 py-1 text-center outline-none focus:border-teal-600"
+              className="w-14 rounded-lg border border-orange-300 bg-white px-2 py-1 text-center outline-none focus:border-orange-600"
             />
             <span className="text-stone-400">/ {numPages || "…"}</span>
           </div>
@@ -1450,7 +1710,7 @@ ${requestText}`;
           <button
             onClick={nextPage}
             disabled={currentPage === numPages}
-            className="rounded-full bg-stone-900 p-3 text-lg leading-none text-white hover:bg-stone-700 disabled:opacity-30"
+            className="rounded-full bg-orange-600 p-3 text-lg leading-none text-white hover:bg-orange-700 disabled:opacity-30"
             aria-label="Next page"
           >
             →
@@ -1477,64 +1737,64 @@ ${requestText}`;
         @keyframes liftShiftNext {
           0% {
             transform: translate(0, 0) scale(1);
-            box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            box-shadow: 0 1px 2px rgba(194, 120, 20, 0.15);
             opacity: 1;
           }
           30% {
             transform: translate(-2%, -16px) scale(0.98);
-            box-shadow: 0 24px 36px -14px rgba(60, 50, 30, 0.35);
+            box-shadow: 0 24px 36px -14px rgba(154, 82, 10, 0.35);
             opacity: 1;
           }
           48% {
             transform: translate(-5%, -20px) scale(0.965);
-            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            box-shadow: 0 28px 42px -14px rgba(154, 82, 10, 0.4);
             opacity: 0.5;
           }
           52% {
             transform: translate(5%, -20px) scale(0.965);
-            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            box-shadow: 0 28px 42px -14px rgba(154, 82, 10, 0.4);
             opacity: 0.5;
           }
           70% {
             transform: translate(2%, -14px) scale(0.98);
-            box-shadow: 0 20px 32px -14px rgba(60, 50, 30, 0.3);
+            box-shadow: 0 20px 32px -14px rgba(154, 82, 10, 0.3);
             opacity: 1;
           }
           100% {
             transform: translate(0, 0) scale(1);
-            box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            box-shadow: 0 1px 2px rgba(194, 120, 20, 0.15);
             opacity: 1;
           }
         }
         @keyframes liftShiftPrev {
           0% {
             transform: translate(0, 0) scale(1);
-            box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            box-shadow: 0 1px 2px rgba(194, 120, 20, 0.15);
             opacity: 1;
           }
           30% {
             transform: translate(2%, -16px) scale(0.98);
-            box-shadow: 0 24px 36px -14px rgba(60, 50, 30, 0.35);
+            box-shadow: 0 24px 36px -14px rgba(154, 82, 10, 0.35);
             opacity: 1;
           }
           48% {
             transform: translate(5%, -20px) scale(0.965);
-            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            box-shadow: 0 28px 42px -14px rgba(154, 82, 10, 0.4);
             opacity: 0.5;
           }
           52% {
             transform: translate(-5%, -20px) scale(0.965);
-            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            box-shadow: 0 28px 42px -14px rgba(154, 82, 10, 0.4);
             opacity: 0.5;
           }
           70% {
             transform: translate(-2%, -14px) scale(0.98);
-            box-shadow: 0 20px 32px -14px rgba(60, 50, 30, 0.3);
+            box-shadow: 0 20px 32px -14px rgba(154, 82, 10, 0.3);
             opacity: 1;
           }
           100% {
             transform: translate(0, 0) scale(1);
-            box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            box-shadow: 0 1px 2px rgba(194, 120, 20, 0.15);
             opacity: 1;
           }
         }
