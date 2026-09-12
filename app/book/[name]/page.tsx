@@ -79,6 +79,9 @@ const Book = () => {
   const [continuousMode, setContinuousMode] = useState<boolean>(false);
   const [flipClass, setFlipClass] = useState<string>("");
 
+  // Mobile toolbar
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+
   // PDF.js references
   const [PDFComponents, setPDFComponents] = useState<{
     Document: any;
@@ -106,6 +109,11 @@ const Book = () => {
   // request, so we can abort it the instant the reader navigates away.
   const aiAbortControllerRef = useRef<AbortController | null>(null);
 
+  // Scroll containers — reset to top on page/tab change so a long page you
+  // scrolled through doesn't leave the next page pre-scrolled down.
+  const mainScrollRef = useRef<HTMLElement | null>(null);
+  const contentScrollRef = useRef<HTMLDivElement | null>(null);
+
   // Runs a function after any currently-running OCR job finishes, and blocks
   // any later job until this one is done. This is what stops "switch language
   // mid-recognize" from ever terminating a worker another call is still using.
@@ -125,6 +133,20 @@ const Book = () => {
   useEffect(() => {
     outputLanguageRef.current = outputLanguage;
   }, [outputLanguage]);
+
+  // Reset scroll position whenever the visible page or the active
+  // translation/explanation tab changes, so the reader always starts each
+  // page at the top instead of wherever the previous page left off.
+  useEffect(() => {
+    mainScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+    contentScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [currentPage, activeAITab]);
+
+  // Close the mobile menu whenever the page changes, so it doesn't linger
+  // open over the newly-turned page.
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [currentPage]);
 
   // Load saved preferences
   useEffect(() => {
@@ -392,45 +414,44 @@ const Book = () => {
   );
 
   const getTesseractWorker = async () => {
-  if (
-    tesseractWorkerRef.current &&
-    activeWorkerLangRef.current === selectedOcrLang
-  ) {
-    return tesseractWorkerRef.current;
-  }
+    if (
+      tesseractWorkerRef.current &&
+      activeWorkerLangRef.current === selectedOcrLang
+    ) {
+      return tesseractWorkerRef.current;
+    }
 
-  if (tesseractWorkerRef.current) {
-    await tesseractWorkerRef.current.terminate();
-  }
+    if (tesseractWorkerRef.current) {
+      await tesseractWorkerRef.current.terminate();
+    }
 
-  const { createWorker, PSM } = await import("tesseract.js");
+    const { createWorker, PSM } = await import("tesseract.js");
 
-  // Self-hosted assets, resolved to absolute URLs on our own origin.
-  const origin = window.location.origin;
+    // Self-hosted assets, resolved to absolute URLs on our own origin.
+    const origin = window.location.origin;
 
-  const worker = await createWorker(selectedOcrLang.split("+"), 1, {
-    workerPath: `${origin}/tesseract/worker.min.js`,
-    corePath: `${origin}/tesseract/tesseract-core-simd-lstm.js`,
-    langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
-    logger: () => {},
-    // Load the worker script directly (new Worker(workerPath)) instead of
-    // fetching it and wrapping it in a blob: URL. The blob-wrapping is only
-    // needed to dodge cross-origin worker restrictions when workerPath
-    // points at a CDN; since we're self-hosting on the same origin, it's
-    // unnecessary — and it was the actual cause of the wasm-resolution
-    // crash, because a worker running from a blob: URL can't correctly
-    // resolve the core.js file's *relative* reference to its own .wasm file.
-    workerBlobURL: false,
-  });
+    const worker = await createWorker(selectedOcrLang.split("+"), 1, {
+      workerPath: `${origin}/tesseract/worker.min.js`,
+      corePath: `${origin}/tesseract/tesseract-core-simd-lstm.js`,
+      langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
+      logger: () => {},
+      // Load the worker script directly instead of fetching it and wrapping
+      // it in a blob: URL. Blob-wrapping is only needed to dodge
+      // cross-origin worker restrictions when workerPath points at a CDN;
+      // since everything is self-hosted on the same origin it's
+      // unnecessary — and it broke the core.js file's relative resolution
+      // of its own .wasm file.
+      workerBlobURL: false,
+    });
 
-  await worker.setParameters({
-    tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
-  });
+    await worker.setParameters({
+      tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+    });
 
-  tesseractWorkerRef.current = worker;
-  activeWorkerLangRef.current = selectedOcrLang;
-  return worker;
-};
+    tesseractWorkerRef.current = worker;
+    activeWorkerLangRef.current = selectedOcrLang;
+    return worker;
+  };
 
   const detectDirection = (str: string): "rtl" | "ltr" => {
     const arabicPattern = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/;
@@ -913,7 +934,7 @@ ${requestText}`;
     setPdfDocProxy(pdf);
   };
 
-  const FLIP_DURATION_MS = 560;
+  const FLIP_DURATION_MS = 500;
 
   const changePageWithFlip = (targetPage: number, direction: "next" | "prev") => {
     if (flipTimeoutRef.current) clearTimeout(flipTimeoutRef.current);
@@ -924,9 +945,9 @@ ${requestText}`;
       setFlipClass(direction === "next" ? "page-flip-next" : "page-flip-prev");
     });
 
-    // Swap the actual page content right as the flipping page is edge-on and
-    // invisible, so what gets "revealed" as the flip completes is genuinely
-    // the new page rather than the old one snapping to new text mid-turn.
+    // Swap the actual page content right at the midpoint, when the lift/fade
+    // is at its deepest — so what "lands" as the animation settles is
+    // genuinely the new page rather than the old one snapping to new text.
     flipSwapTimeoutRef.current = setTimeout(() => {
       setCurrentPage(targetPage);
       setGotoPage(String(targetPage));
@@ -1046,6 +1067,16 @@ ${requestText}`;
     router.push("/");
   }, [book, deleting, numPages, cancelOngoingAIRequest, router]);
 
+  const handleRefreshPage = useCallback(async () => {
+    cancelOngoingAIRequest();
+    await clearCachedData(currentPage);
+    await clearCachedAIDataForPage(currentPage);
+    setTranslationText("");
+    setExplanationText("");
+    setActiveAITab("none");
+    loadActivePageText(currentPage);
+  }, [cancelOngoingAIRequest, clearCachedData, clearCachedAIDataForPage, currentPage, loadActivePageText]);
+
   const Document = PDFComponents?.Document;
   const Page = PDFComponents?.Page;
 
@@ -1078,18 +1109,21 @@ ${requestText}`;
   return (
     <div className="flex h-[100dvh] flex-col overflow-hidden bg-[#f5f1e8]">
 
-      {/* Header / toolbar — fixed-height, always visible, never scrolls away */}
+      {/* Header / toolbar — fixed-height, always visible, never scrolls away.
+          On phones this collapses to Back + title + a hamburger; on sm+
+          screens the full control row shows inline like before. */}
       <header className="z-20 flex-shrink-0 border-b border-stone-200 bg-[#faf7f0]/95 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-2 px-4 py-2.5">
-          <Link href="/" className="m-1.5">
-            <p className="text-bold font-xl">←  Go back </p>
+        <div className="mx-auto flex max-w-3xl items-center justify-between gap-2 px-3 py-2 sm:px-4 sm:py-2.5">
+          <Link href="/" className="shrink-0 text-sm font-semibold text-stone-700 sm:text-base">
+            ← Back
           </Link>
 
-          <h1 className="min-w-0 flex-1 truncate text-base font-semibold text-stone-800 sm:text-lg">
+          <h1 className="min-w-0 flex-1 truncate text-center text-sm font-semibold text-stone-800 sm:text-left sm:text-lg">
             {book.name}
           </h1>
 
-          <div className="flex flex-wrap items-end gap-2">
+          {/* Desktop controls — hidden on phones */}
+          <div className="hidden flex-wrap items-end gap-2 sm:flex">
             <div className="flex flex-col gap-0.5">
               <label htmlFor="book-lang" className="text-[11px] text-stone-500">
                 Book language
@@ -1150,15 +1184,7 @@ ${requestText}`;
             </button>
 
             <button
-              onClick={async () => {
-                cancelOngoingAIRequest();
-                await clearCachedData(currentPage);
-                await clearCachedAIDataForPage(currentPage);
-                setTranslationText("");
-                setExplanationText("");
-                setActiveAITab("none");
-                loadActivePageText(currentPage);
-              }}
+              onClick={handleRefreshPage}
               disabled={ocrLoading}
               className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-sm font-medium text-stone-600 shadow-sm hover:bg-stone-200 disabled:opacity-50"
               title="Re-extract this page's text and clear any cached translation/explanation for it"
@@ -1175,24 +1201,136 @@ ${requestText}`;
               {deleting ? "Deleting…" : "🗑 Delete"}
             </button>
           </div>
+
+          {/* Mobile hamburger — hidden on sm+ */}
+          <button
+            onClick={() => setMobileMenuOpen((v) => !v)}
+            className="flex shrink-0 items-center justify-center rounded-lg bg-stone-100 p-2 text-stone-700 shadow-sm sm:hidden"
+            aria-label="Menu"
+            aria-expanded={mobileMenuOpen}
+          >
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              {mobileMenuOpen ? (
+                <path
+                  d="M5 5l10 10M15 5L5 15"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                />
+              ) : (
+                <path
+                  d="M3 5.5h14M3 10h14M3 14.5h14"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                />
+              )}
+            </svg>
+          </button>
         </div>
+
+        {/* Mobile dropdown panel — all the same controls, stacked */}
+        {mobileMenuOpen && (
+          <div className="border-t border-stone-200 bg-[#faf7f0] px-4 py-3 sm:hidden">
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-2">
+                <div className="flex flex-1 flex-col gap-0.5">
+                  <label htmlFor="book-lang-m" className="text-[11px] text-stone-500">
+                    Book language
+                  </label>
+                  <select
+                    id="book-lang-m"
+                    value={selectedOcrLang}
+                    onChange={(e) =>
+                      setSelectedOcrLang(e.target.value as "eng" | "ara" | "eng+ara")
+                    }
+                    className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                  >
+                    {OCR_LANGUAGE_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex flex-1 flex-col gap-0.5">
+                  <label htmlFor="output-lang-m" className="text-[11px] text-stone-500">
+                    Translate into
+                  </label>
+                  <select
+                    id="output-lang-m"
+                    value={outputLanguage}
+                    onChange={(e) => handleLanguageChange(e.target.value)}
+                    className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-sm font-medium text-stone-700 outline-none focus:border-teal-600"
+                  >
+                    {SUPPORTED_OUTPUT_LANGS.map((lang) => (
+                      <option key={lang} value={lang}>
+                        {lang}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={toggleContinuousMode}
+                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium shadow-sm transition ${
+                    continuousMode
+                      ? "bg-teal-700 text-white"
+                      : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                  }`}
+                >
+                  {continuousMode ? "⏸ Continuous on" : "▶ Continuous"}
+                </button>
+
+                <button
+                  onClick={togglePdfVisible}
+                  className="flex-1 rounded-lg bg-stone-100 px-3 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-200"
+                >
+                  {pdfVisible ? "Hide page" : "Show page"}
+                </button>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleRefreshPage}
+                  disabled={ocrLoading}
+                  className="flex-1 rounded-lg bg-stone-100 px-3 py-2 text-sm font-medium text-stone-600 shadow-sm hover:bg-stone-200 disabled:opacity-50"
+                >
+                  ↻ Refresh page
+                </button>
+
+                <button
+                  onClick={handleDeleteBookForever}
+                  disabled={deleting}
+                  className="flex-1 rounded-lg bg-red-50 px-3 py-2 text-sm font-medium text-red-600 shadow-sm hover:bg-red-100 disabled:opacity-50"
+                >
+                  {deleting ? "Deleting…" : "🗑 Delete book"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* Reading area — fills whatever space is left between header and nav.
           Only this region scrolls (and only if its content needs it); the
           header and bottom nav are always fully visible. */}
       <main
-        className="mx-auto flex w-full min-h-0 max-w-3xl flex-1 flex-col overflow-y-auto px-4 pt-3"
+        ref={mainScrollRef as any}
+        className="mx-auto flex w-full min-h-0 max-w-3xl flex-1 flex-col overflow-y-auto px-3 pt-2 sm:px-4 sm:pt-3"
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
         {/* Collapsible original page preview — small by default, fully hideable */}
         <div
           className={`flex-shrink-0 overflow-hidden transition-all duration-300 ease-in-out ${
-            pdfVisible ? "mb-3 max-h-[38vh] opacity-100" : "mb-0 max-h-0 opacity-0"
+            pdfVisible ? "mb-2 max-h-[26vh] opacity-100 sm:mb-3 sm:max-h-[38vh]" : "mb-0 max-h-0 opacity-0"
           }`}
         >
-          <div className="mx-auto w-full max-w-[220px] rounded-xl border border-stone-200 bg-white p-2 shadow-sm sm:max-w-[260px]">
+          <div className="mx-auto w-full max-w-[160px] rounded-xl border border-stone-200 bg-white p-1.5 shadow-sm sm:max-w-[260px] sm:p-2">
             <Document
               file={book.file}
               onLoadSuccess={handleDocumentLoad}
@@ -1225,13 +1363,13 @@ ${requestText}`;
         {/* The "book page" — translation / explanation reading surface.
             This flexes to fill the remaining height and only its inner text
             area scrolls, so the toolbar/tabs stay pinned in view. */}
-        <div className={`page-stage flex min-h-0 flex-1 flex-col pb-3 ${flipClass}`}>
-          <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-stone-200 bg-[#fffdf7] p-5 shadow-md sm:p-8">
-            <div className="mb-4 flex flex-shrink-0 items-center gap-2 border-b border-stone-200 pb-3">
+        <div className={`page-stage flex min-h-0 flex-1 flex-col pb-2 sm:pb-3 ${flipClass}`}>
+          <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-stone-200 bg-[#fffdf7] p-3 shadow-md sm:p-8">
+            <div className="mb-2 flex flex-shrink-0 items-center gap-2 border-b border-stone-200 pb-2 sm:mb-4 sm:pb-3">
               <button
                 onClick={() => handleAITask("translation")}
                 disabled={aiLoading || !ocrText}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition disabled:opacity-40 ${
+                className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
                   activeAITab === "translation"
                     ? "bg-teal-700 text-white shadow-sm"
                     : "bg-stone-100 text-stone-700 hover:bg-stone-200"
@@ -1242,7 +1380,7 @@ ${requestText}`;
               <button
                 onClick={() => handleAITask("explanation")}
                 disabled={aiLoading || !ocrText}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition disabled:opacity-40 ${
+                className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
                   activeAITab === "explanation"
                     ? "bg-amber-700 text-white shadow-sm"
                     : "bg-stone-100 text-stone-700 hover:bg-stone-200"
@@ -1250,12 +1388,12 @@ ${requestText}`;
               >
                 Explanation
               </button>
-              <span className="ml-auto rounded-full border border-stone-200 bg-stone-50 px-2.5 py-0.5 text-xs font-medium text-stone-500">
-                {outputLanguage} · page {currentPage}
+              <span className="ml-auto whitespace-nowrap rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 text-[10px] font-medium text-stone-500 sm:px-2.5 sm:text-xs">
+                {outputLanguage} · p.{currentPage}
               </span>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <div ref={contentScrollRef} className="min-h-0 flex-1 overflow-y-auto">
               {ocrLoading ? (
                 <p className="py-10 text-center text-sm text-stone-400">
                   Reading this page…
@@ -1271,7 +1409,7 @@ ${requestText}`;
               ) : (
                 <p
                   dir={detectDirection(displayedText)}
-                  className="whitespace-pre-wrap break-words font-serif text-lg leading-8 text-stone-800 sm:text-xl sm:leading-9"
+                  className="whitespace-pre-wrap break-words font-serif text-base leading-7 text-stone-800 sm:text-xl sm:leading-9"
                 >
                   {displayedText || "Nothing generated for this page yet."}
                 </p>
@@ -1323,61 +1461,81 @@ ${requestText}`;
       <style jsx>{`
         .page-stage {
           position: relative;
-          perspective: 1700px;
-          transform-style: preserve-3d;
+          will-change: transform, box-shadow, opacity;
         }
         .page-flip-next {
-          animation: flipNext 0.56s cubic-bezier(0.45, 0, 0.2, 1);
-          transform-origin: left center;
-          backface-visibility: hidden;
-          will-change: transform;
+          animation: liftShiftNext 0.5s cubic-bezier(0.4, 0, 0.2, 1);
         }
         .page-flip-prev {
-          animation: flipPrev 0.56s cubic-bezier(0.45, 0, 0.2, 1);
-          transform-origin: right center;
-          backface-visibility: hidden;
-          will-change: transform;
+          animation: liftShiftPrev 0.5s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        @keyframes flipNext {
+        /* The whole page lifts off the surface, drifts to one side, dips in
+           opacity right as the content swaps underneath (masking the swap
+           instead of exposing it mid-motion), drifts back, and settles down
+           — meant to read as "picked up and set back down" rather than a
+           rigid 3D rotation. */
+        @keyframes liftShiftNext {
           0% {
-            transform: rotateY(0deg) scale(1);
+            transform: translate(0, 0) scale(1);
             box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            opacity: 1;
+          }
+          30% {
+            transform: translate(-2%, -16px) scale(0.98);
+            box-shadow: 0 24px 36px -14px rgba(60, 50, 30, 0.35);
+            opacity: 1;
           }
           48% {
-            transform: rotateY(-88deg) scale(0.97);
-            box-shadow: 30px 0 40px -10px rgba(60, 50, 30, 0.35);
-          }
-          50% {
-            transform: rotateY(-90deg) scale(0.97);
-            box-shadow: 30px 0 40px -10px rgba(60, 50, 30, 0.35);
+            transform: translate(-5%, -20px) scale(0.965);
+            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            opacity: 0.5;
           }
           52% {
-            transform: rotateY(-88deg) scale(0.97);
+            transform: translate(5%, -20px) scale(0.965);
+            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            opacity: 0.5;
+          }
+          70% {
+            transform: translate(2%, -14px) scale(0.98);
+            box-shadow: 0 20px 32px -14px rgba(60, 50, 30, 0.3);
+            opacity: 1;
           }
           100% {
-            transform: rotateY(0deg) scale(1);
+            transform: translate(0, 0) scale(1);
             box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            opacity: 1;
           }
         }
-        @keyframes flipPrev {
+        @keyframes liftShiftPrev {
           0% {
-            transform: rotateY(0deg) scale(1);
+            transform: translate(0, 0) scale(1);
             box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            opacity: 1;
+          }
+          30% {
+            transform: translate(2%, -16px) scale(0.98);
+            box-shadow: 0 24px 36px -14px rgba(60, 50, 30, 0.35);
+            opacity: 1;
           }
           48% {
-            transform: rotateY(88deg) scale(0.97);
-            box-shadow: -30px 0 40px -10px rgba(60, 50, 30, 0.35);
-          }
-          50% {
-            transform: rotateY(90deg) scale(0.97);
-            box-shadow: -30px 0 40px -10px rgba(60, 50, 30, 0.35);
+            transform: translate(5%, -20px) scale(0.965);
+            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            opacity: 0.5;
           }
           52% {
-            transform: rotateY(88deg) scale(0.97);
+            transform: translate(-5%, -20px) scale(0.965);
+            box-shadow: 0 28px 42px -14px rgba(60, 50, 30, 0.4);
+            opacity: 0.5;
+          }
+          70% {
+            transform: translate(-2%, -14px) scale(0.98);
+            box-shadow: 0 20px 32px -14px rgba(60, 50, 30, 0.3);
+            opacity: 1;
           }
           100% {
-            transform: rotateY(0deg) scale(1);
+            transform: translate(0, 0) scale(1);
             box-shadow: 0 1px 2px rgba(120, 108, 80, 0.15);
+            opacity: 1;
           }
         }
         @media (prefers-reduced-motion: reduce) {
