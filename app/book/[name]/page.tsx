@@ -73,7 +73,7 @@ const Book = () => {
   const [outputLanguage, setOutputLanguage] = useState<string>("English");
   const [resultText, setResultText] = useState<string>("");
   const [aiLoading, setAiLoading] = useState<boolean>(false);
-  const [activeAITab, setActiveAITab] = useState<string>("none");
+  const [activeAITab, setActiveAITab] = useState<"translation" | "explanation">("translation");
 
   // Custom prompts states
   const [customPrompts, setCustomPrompts] = useState<CustomPrompt[]>([]);
@@ -117,7 +117,7 @@ const Book = () => {
   const isProcessingQueueRef = useRef<boolean>(false);
   const currentPageRef = useRef<number>(currentPage);
   const outputLanguageRef = useRef<string>(outputLanguage);
-  const activeTaskRef = useRef<string>("none");
+  const activeTaskRef = useRef<"translation" | "explanation">(activeAITab);
   const activeCustomPromptTextRef = useRef<string>("");
   const lastAutoTriggeredRef = useRef<string>("");
   const touchStartXRef = useRef<number | null>(null);
@@ -186,7 +186,6 @@ const Book = () => {
         const match = loadedPrompts.find((p) => p.id === savedActivePrompt);
         if (match) {
           activeCustomPromptTextRef.current = match.prompt;
-          setActiveAITab(`custom:${match.id}`);
         }
       }
     } catch (err) {
@@ -289,66 +288,6 @@ const Book = () => {
     }
   };
 
-  // Switch/apply immediately on click
-  const selectAndAutoApplyPrompt = (p: CustomPrompt) => {
-    persistActivePromptId(p.id);
-    activeCustomPromptTextRef.current = p.prompt;
-    handleAITask(`custom:${p.id}`, p.prompt);
-  };
-
-  const savePromptForm = () => {
-    const name = newPromptName.trim();
-    const text = newPromptText.trim();
-    if (!name || !text) return;
-
-    let targetPrompt: CustomPrompt;
-
-    if (editingPromptId) {
-      targetPrompt = { id: editingPromptId, name, prompt: text };
-      const updated = customPrompts.map((p) =>
-        p.id === editingPromptId ? targetPrompt : p
-      );
-      persistCustomPrompts(updated);
-    } else {
-      targetPrompt = {
-        id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-        name,
-        prompt: text,
-      };
-      persistCustomPrompts([...customPrompts, targetPrompt]);
-    }
-
-    setShowNewPromptForm(false);
-    setEditingPromptId(null);
-    setNewPromptName("");
-    setNewPromptText("");
-
-    // Automatically apply the saved prompt immediately
-    selectAndAutoApplyPrompt(targetPrompt);
-    setMobileMenuOpen(false);
-  };
-
-  const deleteCustomPrompt = (id: string) => {
-    const nextList = customPrompts.filter((p) => p.id !== id);
-    persistCustomPrompts(nextList);
-    if (activePromptId === id) {
-      persistActivePromptId(null);
-      setActiveAITab("none");
-      setResultText("");
-      activeCustomPromptTextRef.current = "";
-    }
-  };
-
-  const getTaskLabel = useCallback(
-    (taskKey: string): string => {
-      if (taskKey === "translation") return "Translation";
-      if (taskKey === "explanation") return "Explanation";
-      const id = taskKey.startsWith("custom:") ? taskKey.slice("custom:".length) : "";
-      return customPrompts.find((p) => p.id === id)?.name || "Custom Prompt";
-    },
-    [customPrompts]
-  );
-
   const cancelOngoingAIRequest = useCallback(() => {
     if (aiAbortControllerRef.current) {
       aiAbortControllerRef.current.abort();
@@ -407,8 +346,8 @@ const Book = () => {
 
   const getAIStorageKey = useCallback(
     (pageNum: number, lang: string) =>
-      `page_ai_${book?.name || "book"}_p${pageNum}_${lang}_${selectedOcrLang}`,
-    [book?.name, selectedOcrLang]
+      `page_ai_${book?.name || "book"}_p${pageNum}_${lang}_${selectedOcrLang}_${activePromptId || "base"}`,
+    [book?.name, selectedOcrLang, activePromptId]
   );
 
   const getCachedAIData = useCallback(
@@ -482,7 +421,7 @@ const Book = () => {
 
   useEffect(() => {
     const syncAICache = async () => {
-      if (!book || activeAITab === "none") {
+      if (!book) {
         setResultText("");
         return;
       }
@@ -816,40 +755,34 @@ const Book = () => {
     return match ? match[1].trim() : raw.trim();
   };
 
+  // Build unified prompt: always includes custom prompt directives if one is active
   const buildPrompt = (
-    taskKey: string,
+    taskKey: "translation" | "explanation",
     lang: string,
     text: string,
     previousPageContext: string,
-    customText?: string
+    customInstructions?: string
   ): string => {
+    const customSection = customInstructions?.trim()
+      ? `\n--- USER CUSTOM INSTRUCTIONS (APPLY ALWAYS) ---\n${customInstructions.trim()}\n`
+      : "";
+
     if (taskKey === "translation") {
       return `Translate the following text accurately into ${lang}.
 Preserve the meaning and important context.
 Automatically detect the source language.
-Return ONLY the result inside <artifact></artifact> tags.
+${customSection}
+Return ONLY the final translated result inside <artifact></artifact> tags.
 
 --- SOURCE TEXT ---
 ${text}`;
     }
 
-    if (taskKey === "explanation") {
-      return `Explain the following book content clearly in ${lang}.
+    return `Explain the following book content clearly in ${lang}.
 ${previousPageContext ? "Use the previous page context to understand continuation." : ""}
 Automatically detect the source language.
+${customSection}
 Return ONLY the explanation inside <artifact></artifact> tags.
-
-${previousPageContext}
-
---- CURRENT PAGE CONTENT ---
-${text}`;
-    }
-
-    return `${customText || "Analyze the following page."}
-${lang !== "Same as original" ? `Respond in ${lang}.` : ""}
-${previousPageContext ? "Use the previous page context to understand continuation." : ""}
-Automatically detect the source language of the material.
-Return ONLY the result inside <artifact></artifact> tags.
 
 ${previousPageContext}
 
@@ -858,7 +791,7 @@ ${text}`;
   };
 
   const prefetchAIForPage = useCallback(
-    async (pageNum: number, taskKey: string, lang: string, customText?: string) => {
+    async (pageNum: number, taskKey: "translation" | "explanation", lang: string, customText?: string) => {
       if (pageNum < 1 || pageNum > numPages || !pdfDocProxy) return;
 
       const existingAI = await getCachedAIData(pageNum, lang);
@@ -875,7 +808,7 @@ ${text}`;
       if (!extraction || !extraction.text.trim()) return;
 
       let previousPageContext = "";
-      if (taskKey !== "translation" && pageNum > 1) {
+      if (taskKey === "explanation" && pageNum > 1) {
         const prevData = await getCachedData(pageNum - 1);
         if (prevData?.text) {
           previousPageContext = `\n--- PREVIOUS PAGE CONTEXT ---\n${prevData.text.slice(-500)}`;
@@ -907,14 +840,13 @@ ${text}`;
   );
 
   const handleAITask = useCallback(
-    async (taskKey: string, customText?: string) => {
+    async (taskKey: "translation" | "explanation", explicitCustomText?: string) => {
       if (!ocrText.trim()) return;
 
       const requestPage = currentPage;
       const requestLang = outputLanguage;
       const requestText = ocrText;
-      const requestCustomText =
-        customText ?? (taskKey.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined);
+      const activeCustomText = explicitCustomText ?? activeCustomPromptTextRef.current;
 
       const isStillRelevant = () =>
         currentPageRef.current === requestPage &&
@@ -923,9 +855,8 @@ ${text}`;
 
       setActiveAITab(taskKey);
       activeTaskRef.current = taskKey;
-      if (requestCustomText !== undefined) activeCustomPromptTextRef.current = requestCustomText;
 
-      prefetchAIForPage(requestPage + 1, taskKey, requestLang, requestCustomText);
+      prefetchAIForPage(requestPage + 1, taskKey, requestLang, activeCustomText);
 
       const existingCache = await getCachedAIData(requestPage, requestLang);
       if (existingCache?.[taskKey]) {
@@ -941,14 +872,14 @@ ${text}`;
 
       try {
         let previousPageContext = "";
-        if (taskKey !== "translation" && requestPage > 1) {
+        if (taskKey === "explanation" && requestPage > 1) {
           const prevPageData = await getCachedData(requestPage - 1);
           if (prevPageData?.text) {
             previousPageContext = `\n--- PREVIOUS PAGE CONTEXT ---\n${prevPageData.text.slice(-500)}`;
           }
         }
 
-        const prompt = buildPrompt(taskKey, requestLang, requestText, previousPageContext, requestCustomText);
+        const prompt = buildPrompt(taskKey, requestLang, requestText, previousPageContext, activeCustomText);
 
         const res = await fetch("/api/ai", {
           method: "POST",
@@ -977,7 +908,7 @@ ${text}`;
         if (err?.name === "AbortError") return;
         console.error(err);
         if (isStillRelevant()) {
-          setResultText(`${getTaskLabel(taskKey)} failed. Please try again.`);
+          setResultText(`${taskKey === "translation" ? "Translation" : "Explanation"} failed. Try again.`);
         }
       } finally {
         const stillCurrent = aiAbortControllerRef.current === controller;
@@ -993,38 +924,73 @@ ${text}`;
       setCachedAIData,
       getCachedData,
       prefetchAIForPage,
-      getTaskLabel,
     ]
   );
 
-  // Auto-apply logic
+  // Auto-run trigger: runs every time the page or extracted text updates
   useEffect(() => {
     if (!ocrText.trim()) return;
 
-    // Auto-trigger if a prompt is active
-    let taskToRun = activeAITab;
-    let customTextToRun: string | undefined = undefined;
-
-    if (activeAITab === "none" && activePromptId) {
-      const activePrompt = customPrompts.find((p) => p.id === activePromptId);
-      if (activePrompt) {
-        taskToRun = `custom:${activePrompt.id}`;
-        customTextToRun = activePrompt.prompt;
-        activeCustomPromptTextRef.current = activePrompt.prompt;
-      }
-    }
-
-    if (taskToRun === "none") return;
-
-    const key = `${currentPage}|${taskToRun}|${outputLanguage}`;
+    const key = `${currentPage}|${activeAITab}|${outputLanguage}|${activePromptId || "none"}`;
     if (lastAutoTriggeredRef.current === key) return;
     lastAutoTriggeredRef.current = key;
 
-    handleAITask(
-      taskToRun,
-      customTextToRun ?? (taskToRun.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined)
-    );
-  }, [continuousMode, currentPage, ocrText, activeAITab, outputLanguage, activePromptId, customPrompts, handleAITask]);
+    handleAITask(activeAITab);
+  }, [continuousMode, currentPage, ocrText, activeAITab, outputLanguage, activePromptId, handleAITask]);
+
+  // Handle prompt switch: selects, persists, invalidates cache for fresh response, and runs immediately
+  const handleSelectPrompt = (p: CustomPrompt | null) => {
+    const newId = p ? p.id : null;
+    const newText = p ? p.prompt : "";
+    persistActivePromptId(newId);
+    activeCustomPromptTextRef.current = newText;
+    setMobileMenuOpen(false);
+
+    // Clear stale page-level cache and trigger immediately with the newly selected prompt
+    clearCachedAIDataForPage(currentPage);
+    setResultText("");
+    lastAutoTriggeredRef.current = "";
+    handleAITask(activeAITab, newText);
+  };
+
+  const savePromptForm = () => {
+    const name = newPromptName.trim();
+    const text = newPromptText.trim();
+    if (!name || !text) return;
+
+    let targetPrompt: CustomPrompt;
+
+    if (editingPromptId) {
+      targetPrompt = { id: editingPromptId, name, prompt: text };
+      const updated = customPrompts.map((p) =>
+        p.id === editingPromptId ? targetPrompt : p
+      );
+      persistCustomPrompts(updated);
+    } else {
+      targetPrompt = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        name,
+        prompt: text,
+      };
+      persistCustomPrompts([...customPrompts, targetPrompt]);
+    }
+
+    setShowNewPromptForm(false);
+    setEditingPromptId(null);
+    setNewPromptName("");
+    setNewPromptText("");
+
+    // Automatically select & apply newly saved prompt
+    handleSelectPrompt(targetPrompt);
+  };
+
+  const deleteCustomPrompt = (id: string) => {
+    const nextList = customPrompts.filter((p) => p.id !== id);
+    persistCustomPrompts(nextList);
+    if (activePromptId === id) {
+      handleSelectPrompt(null);
+    }
+  };
 
   const handleDocumentLoad = (pdf: any) => {
     setNumPages(pdf.numPages);
@@ -1120,7 +1086,7 @@ ${text}`;
           localStorage.removeItem(extractionKey);
 
           for (const lang of SUPPORTED_OUTPUT_LANGS) {
-            const aiKey = `page_ai_${book.name}_p${p}_${lang}_${ocrOpt.value}`;
+            const aiKey = `page_ai_${book.name}_p${p}_${lang}_${ocrOpt.value}_${activePromptId || "base"}`;
             try {
               if (db.objectStoreNames.contains("ai_translations")) {
                 await db.delete("ai_translations", aiKey);
@@ -1138,14 +1104,15 @@ ${text}`;
     }
 
     router.push("/");
-  }, [book, deleting, numPages, cancelOngoingAIRequest, router]);
+  }, [book, deleting, numPages, cancelOngoingAIRequest, activePromptId, router]);
 
+  // Refresh Page: clears cache and re-runs OCR & AI directly
   const handleRefreshPage = useCallback(async () => {
     cancelOngoingAIRequest();
     await clearCachedData(currentPage);
     await clearCachedAIDataForPage(currentPage);
     setResultText("");
-    setActiveAITab("none");
+    lastAutoTriggeredRef.current = "";
     loadActivePageText(currentPage);
   }, [cancelOngoingAIRequest, clearCachedData, clearCachedAIDataForPage, currentPage, loadActivePageText]);
 
@@ -1231,16 +1198,18 @@ ${text}`;
                 {pdfVisible ? "Hide PDF" : "Show PDF"}
               </button>
 
+              {/* Refresh Button */}
               <button
                 onClick={handleRefreshPage}
                 disabled={ocrLoading}
-                className="rounded-md bg-orange-100 px-2 py-1 text-xs font-medium text-orange-800 hover:bg-orange-200 disabled:opacity-50"
+                className="rounded-md bg-orange-100 px-2.5 py-1 text-xs font-medium text-orange-800 hover:bg-orange-200 disabled:opacity-50"
+                title="Re-run OCR and regeneration for current page"
               >
-                ↻ Re-run
+                ↻ Refresh Page
               </button>
             </div>
 
-            {/* Custom Prompts & Settings Trigger */}
+            {/* Prompt Drawer Trigger */}
             <button
               onClick={() => setMobileMenuOpen(true)}
               className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
@@ -1328,7 +1297,7 @@ ${text}`;
           </div>
         )}
 
-        {/* Reading & AI Surface */}
+        {/* Reading Surface */}
         <div
           className={`flex flex-1 flex-col min-h-0 bg-white select-text overflow-hidden ${flipClass}`}
           onTouchStart={handleTouchStart}
@@ -1336,16 +1305,13 @@ ${text}`;
         >
           {/* Quick Task Bar */}
           <div className="flex shrink-0 items-center justify-between border-b border-orange-100 bg-orange-50/40 px-3 py-1.5 sm:px-4">
-            <div className="flex items-center gap-1.5 overflow-x-auto py-0.5 no-scrollbar">
+            <div className="flex items-center gap-1.5">
               <button
-                onClick={() => {
-                  persistActivePromptId(null);
-                  handleAITask("translation");
-                }}
+                onClick={() => handleAITask("translation")}
                 disabled={aiLoading || !ocrText}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition shrink-0 ${
+                className={`rounded-md px-3 py-1 text-xs font-medium transition ${
                   activeAITab === "translation"
-                    ? "bg-orange-600 text-white"
+                    ? "bg-orange-600 text-white shadow-sm"
                     : "bg-white text-stone-700 hover:bg-orange-100 border border-orange-200"
                 }`}
               >
@@ -1353,28 +1319,19 @@ ${text}`;
               </button>
 
               <button
-                onClick={() => {
-                  persistActivePromptId(null);
-                  handleAITask("explanation");
-                }}
+                onClick={() => handleAITask("explanation")}
                 disabled={aiLoading || !ocrText}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition shrink-0 ${
+                className={`rounded-md px-3 py-1 text-xs font-medium transition ${
                   activeAITab === "explanation"
-                    ? "bg-amber-600 text-white"
+                    ? "bg-amber-600 text-white shadow-sm"
                     : "bg-white text-stone-700 hover:bg-orange-100 border border-orange-200"
                 }`}
               >
                 Explain
               </button>
-
-              {activeAITab.startsWith("custom:") && (
-                <span className="flex items-center gap-1 rounded-md bg-stone-800 px-2 py-1 text-xs font-medium text-white shrink-0">
-                  <span className="max-w-[140px] truncate">{getTaskLabel(activeAITab)}</span>
-                </span>
-              )}
             </div>
 
-            <span className="text-[10px] sm:text-xs text-stone-500 shrink-0 font-medium">
+            <span className="text-[10px] sm:text-xs text-stone-500 font-medium">
               {outputLanguage}
             </span>
           </div>
@@ -1385,14 +1342,10 @@ ${text}`;
             className="flex-1 overflow-y-auto px-4 py-4 sm:px-8 sm:py-6"
           >
             {ocrLoading ? (
-              <p className="text-center text-xs text-stone-400 mt-8">Reading page content...</p>
-            ) : activeAITab === "none" ? (
-              <div className="mx-auto max-w-md text-center text-stone-400 mt-8 text-xs sm:text-sm">
-                Select <strong>Translate</strong>, <strong>Explain</strong>, or tap <strong>Prompts & Settings</strong> to select a prompt.
-              </div>
+              <p className="text-center text-xs text-stone-400 mt-8">Scanning and extracting page text...</p>
             ) : aiLoading ? (
               <p className="animate-pulse text-center text-xs text-stone-400 mt-8">
-                Generating {getTaskLabel(activeAITab)}...
+                Processing {activeAITab === "translation" ? "Translation" : "Explanation"}...
               </p>
             ) : (
               <div
@@ -1457,7 +1410,7 @@ ${text}`;
 
           <div className="relative ml-auto flex h-full w-full max-w-md flex-col bg-white p-4 shadow-xl">
             <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-              <h2 className="text-sm font-semibold text-stone-800">Prompts & Options</h2>
+              <h2 className="text-sm font-semibold text-stone-800">Settings & Custom Prompts</h2>
               <button
                 onClick={() => setMobileMenuOpen(false)}
                 className="rounded-md p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-600"
@@ -1519,13 +1472,25 @@ ${text}`;
                     {pdfVisible ? "Hide PDF" : "Show PDF"}
                   </button>
                 </div>
+
+                {/* Mobile Refresh Button */}
+                <button
+                  onClick={() => {
+                    handleRefreshPage();
+                    setMobileMenuOpen(false);
+                  }}
+                  disabled={ocrLoading}
+                  className="w-full rounded bg-orange-100 py-1.5 text-xs font-medium text-orange-800 hover:bg-orange-200 disabled:opacity-50"
+                >
+                  ↻ Refresh Page
+                </button>
               </div>
 
-              {/* Custom Prompts - Tap once to auto-apply */}
+              {/* Custom Prompts (Applied in conjunction with Translation/Explanation) */}
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-stone-400">
-                    Tap a prompt to apply
+                    Active Prompt Directives
                   </span>
                   <button
                     onClick={() => {
@@ -1540,9 +1505,25 @@ ${text}`;
                   </button>
                 </div>
 
-                {customPrompts.length === 0 && !showNewPromptForm && (
-                  <p className="text-xs text-stone-400">No prompts created yet.</p>
-                )}
+                {/* Default: Standard translation/explanation */}
+                <div
+                  onClick={() => handleSelectPrompt(null)}
+                  className={`group relative flex flex-col gap-0.5 rounded-lg border p-2.5 mb-2 cursor-pointer transition ${
+                    activePromptId === null
+                      ? "border-orange-500 bg-orange-50/70 ring-1 ring-orange-500"
+                      : "border-stone-200 bg-white hover:border-orange-200 hover:bg-orange-50/20"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-stone-800 flex items-center gap-1.5">
+                      <span className={`inline-block h-2 w-2 rounded-full ${activePromptId === null ? "bg-orange-600" : "bg-stone-300"}`} />
+                      Standard (Default)
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-stone-500">
+                    Pure translation or explanation with no extra directives.
+                  </p>
+                </div>
 
                 <div className="space-y-2">
                   {customPrompts.map((p) => {
@@ -1550,11 +1531,8 @@ ${text}`;
                     return (
                       <div
                         key={p.id}
-                        onClick={() => {
-                          selectAndAutoApplyPrompt(p);
-                          setMobileMenuOpen(false);
-                        }}
-                        className={`group relative flex flex-col gap-1 rounded-lg border p-3 cursor-pointer transition ${
+                        onClick={() => handleSelectPrompt(p)}
+                        className={`group relative flex flex-col gap-1 rounded-lg border p-2.5 cursor-pointer transition ${
                           isSelected
                             ? "border-orange-500 bg-orange-50/70 ring-1 ring-orange-500"
                             : "border-stone-200 bg-white hover:border-orange-200 hover:bg-orange-50/20"
@@ -1606,14 +1584,14 @@ ${text}`;
                     </span>
                     <input
                       type="text"
-                      placeholder="Title (e.g. Summary, Vocabulary)"
+                      placeholder="Prompt Title (e.g., Simple Language, Add Notes)"
                       value={newPromptName}
                       onChange={(e) => setNewPromptName(e.target.value)}
                       className="w-full rounded border border-stone-200 bg-white p-1.5 text-xs outline-none focus:border-orange-500"
                     />
                     <textarea
                       rows={3}
-                      placeholder="Prompt instructions..."
+                      placeholder="Instructions sent along with translation/explanation..."
                       value={newPromptText}
                       onChange={(e) => setNewPromptText(e.target.value)}
                       className="w-full rounded border border-stone-200 bg-white p-1.5 text-xs outline-none focus:border-orange-500"
