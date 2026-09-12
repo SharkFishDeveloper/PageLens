@@ -90,9 +90,9 @@ const Book = () => {
   const [continuousMode, setContinuousMode] = useState<boolean>(true);
   const [flipClass, setFlipClass] = useState<string>("");
 
-  // Resizable split-pane states (LeetCode style)
-  const [splitPercent, setSplitPercent] = useState<number>(50); // Desktop width %
-  const [splitHeightPx, setSplitHeightPx] = useState<number>(240); // Mobile height px
+  // Resizable split-pane states
+  const [splitPercent, setSplitPercent] = useState<number>(50);
+  const [splitHeightPx, setSplitHeightPx] = useState<number>(240);
   const isDraggingRef = useRef<boolean>(false);
 
   // Drawer / Menu
@@ -165,11 +165,15 @@ const Book = () => {
     const savedPdfVisible = localStorage.getItem("reader_pdf_visible");
     if (savedPdfVisible === "0") setPdfVisible(false);
 
+    let loadedPrompts: CustomPrompt[] = [];
     try {
       const rawPrompts = localStorage.getItem(CUSTOM_PROMPTS_STORAGE_KEY);
       if (rawPrompts) {
         const parsed = JSON.parse(rawPrompts);
-        if (Array.isArray(parsed)) setCustomPrompts(parsed);
+        if (Array.isArray(parsed)) {
+          loadedPrompts = parsed;
+          setCustomPrompts(parsed);
+        }
       }
     } catch (err) {
       console.warn("Could not load saved custom prompts", err);
@@ -177,13 +181,19 @@ const Book = () => {
 
     try {
       const savedActivePrompt = localStorage.getItem(ACTIVE_PROMPT_STORAGE_KEY);
-      if (savedActivePrompt) setActivePromptId(savedActivePrompt);
+      if (savedActivePrompt) {
+        setActivePromptId(savedActivePrompt);
+        const match = loadedPrompts.find((p) => p.id === savedActivePrompt);
+        if (match) {
+          activeCustomPromptTextRef.current = match.prompt;
+          setActiveAITab(`custom:${match.id}`);
+        }
+      }
     } catch (err) {
       console.warn("Could not load active custom prompt", err);
     }
   }, []);
 
-  // Update PDF base width for rendering clarity
   useEffect(() => {
     const el = pdfContainerRef.current;
     if (!el || !pdfVisible) return;
@@ -198,7 +208,7 @@ const Book = () => {
     return () => ro.disconnect();
   }, [pdfVisible, splitPercent]);
 
-  // Handle pane resizing (Desktop and Mobile)
+  // Split-pane Resizer
   const startResizing = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     e.preventDefault();
     isDraggingRef.current = true;
@@ -279,7 +289,8 @@ const Book = () => {
     }
   };
 
-  const applyCustomPrompt = (p: CustomPrompt) => {
+  // Switch/apply immediately on click
+  const selectAndAutoApplyPrompt = (p: CustomPrompt) => {
     persistActivePromptId(p.id);
     activeCustomPromptTextRef.current = p.prompt;
     handleAITask(`custom:${p.id}`, p.prompt);
@@ -290,29 +301,31 @@ const Book = () => {
     const text = newPromptText.trim();
     if (!name || !text) return;
 
+    let targetPrompt: CustomPrompt;
+
     if (editingPromptId) {
+      targetPrompt = { id: editingPromptId, name, prompt: text };
       const updated = customPrompts.map((p) =>
-        p.id === editingPromptId ? { ...p, name, prompt: text } : p
+        p.id === editingPromptId ? targetPrompt : p
       );
       persistCustomPrompts(updated);
-      if (activePromptId === editingPromptId) {
-        activeCustomPromptTextRef.current = text;
-        handleAITask(`custom:${editingPromptId}`, text);
-      }
     } else {
-      const newPrompt: CustomPrompt = {
+      targetPrompt = {
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         name,
         prompt: text,
       };
-      persistCustomPrompts([...customPrompts, newPrompt]);
-      applyCustomPrompt(newPrompt);
+      persistCustomPrompts([...customPrompts, targetPrompt]);
     }
 
     setShowNewPromptForm(false);
     setEditingPromptId(null);
     setNewPromptName("");
     setNewPromptText("");
+
+    // Automatically apply the saved prompt immediately
+    selectAndAutoApplyPrompt(targetPrompt);
+    setMobileMenuOpen(false);
   };
 
   const deleteCustomPrompt = (id: string) => {
@@ -984,28 +997,32 @@ ${text}`;
     ]
   );
 
-  // Trigger continuous processing or default/active prompt on text ready
+  // Auto-apply logic
   useEffect(() => {
     if (!ocrText.trim()) return;
 
-    // Apply stored prompt if nothing is running yet
+    // Auto-trigger if a prompt is active
+    let taskToRun = activeAITab;
+    let customTextToRun: string | undefined = undefined;
+
     if (activeAITab === "none" && activePromptId) {
       const activePrompt = customPrompts.find((p) => p.id === activePromptId);
       if (activePrompt) {
-        applyCustomPrompt(activePrompt);
-        return;
+        taskToRun = `custom:${activePrompt.id}`;
+        customTextToRun = activePrompt.prompt;
+        activeCustomPromptTextRef.current = activePrompt.prompt;
       }
     }
 
-    if (!continuousMode || activeAITab === "none") return;
+    if (taskToRun === "none") return;
 
-    const key = `${currentPage}|${activeAITab}|${outputLanguage}`;
+    const key = `${currentPage}|${taskToRun}|${outputLanguage}`;
     if (lastAutoTriggeredRef.current === key) return;
     lastAutoTriggeredRef.current = key;
 
     handleAITask(
-      activeAITab,
-      activeAITab.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined
+      taskToRun,
+      customTextToRun ?? (taskToRun.startsWith("custom:") ? activeCustomPromptTextRef.current : undefined)
     );
   }, [continuousMode, currentPage, ocrText, activeAITab, outputLanguage, activePromptId, customPrompts, handleAITask]);
 
@@ -1170,7 +1187,7 @@ ${text}`;
           </div>
 
           <div className="flex items-center gap-1.5">
-            {/* Desktop toolbar items */}
+            {/* Desktop toolbar */}
             <div className="hidden md:flex items-center gap-2">
               <select
                 value={selectedOcrLang}
@@ -1223,15 +1240,19 @@ ${text}`;
               </button>
             </div>
 
-            {/* Slide-out Menu Trigger (Houses Custom Prompts + Mobile controls) */}
+            {/* Custom Prompts & Settings Trigger */}
             <button
               onClick={() => setMobileMenuOpen(true)}
-              className="flex items-center gap-1.5 rounded-lg bg-orange-100 px-2.5 py-1 text-xs font-medium text-orange-900 hover:bg-orange-200 transition"
+              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+                activePromptId
+                  ? "bg-orange-600 text-white shadow-sm"
+                  : "bg-orange-100 text-orange-900 hover:bg-orange-200"
+              }`}
               aria-label="Open menu"
             >
-              <span>⚙ Options & Prompts</span>
+              <span>Prompts & Settings</span>
               {activePromptId && (
-                <span className="inline-block h-2 w-2 rounded-full bg-orange-600"></span>
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-white animate-pulse"></span>
               )}
             </button>
           </div>
@@ -1252,10 +1273,9 @@ ${text}`;
             }}
             className="flex flex-col border-b md:border-b-0 md:border-r border-orange-200 bg-stone-100 min-h-0 overflow-hidden shrink-0 select-auto"
           >
-            {/* Micro toolbar for PDF */}
             <div className="flex items-center justify-between border-b border-stone-200 bg-stone-50 px-2 py-1 text-[11px] text-stone-600 shrink-0">
               <span className="font-semibold uppercase tracking-wider text-[10px] text-stone-500">
-                PDF · {currentExtractionType === "pdf-text" ? "Embedded text" : "OCR Mode"}
+                PDF · {currentExtractionType === "pdf-text" ? "Embedded text" : "OCR"}
               </span>
               <div className="flex items-center gap-1">
                 <button
@@ -1274,7 +1294,6 @@ ${text}`;
               </div>
             </div>
 
-            {/* Scrollable Document Container */}
             <div
               ref={pdfContainerRef}
               className="flex-1 overflow-auto p-2 touch-pan-x touch-pan-y"
@@ -1319,7 +1338,10 @@ ${text}`;
           <div className="flex shrink-0 items-center justify-between border-b border-orange-100 bg-orange-50/40 px-3 py-1.5 sm:px-4">
             <div className="flex items-center gap-1.5 overflow-x-auto py-0.5 no-scrollbar">
               <button
-                onClick={() => handleAITask("translation")}
+                onClick={() => {
+                  persistActivePromptId(null);
+                  handleAITask("translation");
+                }}
                 disabled={aiLoading || !ocrText}
                 className={`rounded-md px-2.5 py-1 text-xs font-medium transition shrink-0 ${
                   activeAITab === "translation"
@@ -1331,7 +1353,10 @@ ${text}`;
               </button>
 
               <button
-                onClick={() => handleAITask("explanation")}
+                onClick={() => {
+                  persistActivePromptId(null);
+                  handleAITask("explanation");
+                }}
                 disabled={aiLoading || !ocrText}
                 className={`rounded-md px-2.5 py-1 text-xs font-medium transition shrink-0 ${
                   activeAITab === "explanation"
@@ -1343,8 +1368,8 @@ ${text}`;
               </button>
 
               {activeAITab.startsWith("custom:") && (
-                <span className="rounded-md bg-stone-800 px-2 py-1 text-xs font-medium text-white shrink-0">
-                  ⚡ {getTaskLabel(activeAITab)}
+                <span className="flex items-center gap-1 rounded-md bg-stone-800 px-2 py-1 text-xs font-medium text-white shrink-0">
+                  <span className="max-w-[140px] truncate">{getTaskLabel(activeAITab)}</span>
                 </span>
               )}
             </div>
@@ -1363,11 +1388,11 @@ ${text}`;
               <p className="text-center text-xs text-stone-400 mt-8">Reading page content...</p>
             ) : activeAITab === "none" ? (
               <div className="mx-auto max-w-md text-center text-stone-400 mt-8 text-xs sm:text-sm">
-                Select <strong>Translate</strong>, <strong>Explain</strong>, or tap <strong>Options & Prompts</strong> to activate custom queries for this page.
+                Select <strong>Translate</strong>, <strong>Explain</strong>, or tap <strong>Prompts & Settings</strong> to select a prompt.
               </div>
             ) : aiLoading ? (
               <p className="animate-pulse text-center text-xs text-stone-400 mt-8">
-                Processing {getTaskLabel(activeAITab)}...
+                Generating {getTaskLabel(activeAITab)}...
               </p>
             ) : (
               <div
@@ -1380,7 +1405,7 @@ ${text}`;
                 }
                 className="font-serif text-sm sm:text-base leading-relaxed text-stone-800 whitespace-pre-wrap break-words"
               >
-                {resultText || "No content extracted or generated yet."}
+                {resultText || "No content generated for this page."}
               </div>
             )}
           </div>
@@ -1425,16 +1450,14 @@ ${text}`;
       {/* Slide-out Drawer: Custom Prompts + Preferences */}
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-50 flex">
-          {/* Backdrop */}
           <div
             className="fixed inset-0 bg-stone-900/40 backdrop-blur-sm"
             onClick={() => setMobileMenuOpen(false)}
           />
 
-          {/* Drawer Body */}
           <div className="relative ml-auto flex h-full w-full max-w-md flex-col bg-white p-4 shadow-xl">
             <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-              <h2 className="text-sm font-semibold text-stone-800">Options & Custom Prompts</h2>
+              <h2 className="text-sm font-semibold text-stone-800">Prompts & Options</h2>
               <button
                 onClick={() => setMobileMenuOpen(false)}
                 className="rounded-md p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-600"
@@ -1444,7 +1467,7 @@ ${text}`;
             </div>
 
             <div className="flex-1 overflow-y-auto py-3 space-y-4">
-              {/* Quick Settings on Mobile */}
+              {/* Mobile Quick Config */}
               <div className="space-y-2 border-b border-stone-100 pb-3 md:hidden">
                 <span className="text-[11px] font-bold uppercase tracking-wider text-stone-400">
                   Settings
@@ -1498,11 +1521,11 @@ ${text}`;
                 </div>
               </div>
 
-              {/* Custom Prompts Management */}
+              {/* Custom Prompts - Tap once to auto-apply */}
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-stone-400">
-                    Custom Prompts
+                    Tap a prompt to apply
                   </span>
                   <button
                     onClick={() => {
@@ -1518,7 +1541,7 @@ ${text}`;
                 </div>
 
                 {customPrompts.length === 0 && !showNewPromptForm && (
-                  <p className="text-xs text-stone-400">No custom prompts created yet.</p>
+                  <p className="text-xs text-stone-400">No prompts created yet.</p>
                 )}
 
                 <div className="space-y-2">
@@ -1527,31 +1550,26 @@ ${text}`;
                     return (
                       <div
                         key={p.id}
-                        className={`flex flex-col gap-1 rounded-lg border p-2.5 transition ${
+                        onClick={() => {
+                          selectAndAutoApplyPrompt(p);
+                          setMobileMenuOpen(false);
+                        }}
+                        className={`group relative flex flex-col gap-1 rounded-lg border p-3 cursor-pointer transition ${
                           isSelected
-                            ? "border-orange-500 bg-orange-50/50"
-                            : "border-stone-200 bg-white"
+                            ? "border-orange-500 bg-orange-50/70 ring-1 ring-orange-500"
+                            : "border-stone-200 bg-white hover:border-orange-200 hover:bg-orange-50/20"
                         }`}
                       >
                         <div className="flex items-center justify-between">
-                          <button
-                            onClick={() => {
-                              applyCustomPrompt(p);
-                              setMobileMenuOpen(false);
-                            }}
-                            className="flex-1 text-left"
-                          >
-                            <span className="text-xs font-semibold text-stone-800 flex items-center gap-1.5">
-                              {p.name}
-                              {isSelected && (
-                                <span className="rounded bg-orange-600 px-1.5 py-0.2 text-[9px] font-bold text-white">
-                                  APPLIED
-                                </span>
-                              )}
-                            </span>
-                          </button>
+                          <span className="text-xs font-semibold text-stone-800 flex items-center gap-1.5">
+                            <span className={`inline-block h-2 w-2 rounded-full ${isSelected ? "bg-orange-600" : "bg-stone-300"}`} />
+                            {p.name}
+                          </span>
 
-                          <div className="flex items-center gap-1 text-[11px]">
+                          <div
+                            className="flex items-center gap-2 text-[11px]"
+                            onClick={(e) => e.stopPropagation()}
+                          >
                             <button
                               onClick={() => {
                                 setEditingPromptId(p.id);
@@ -1559,40 +1577,28 @@ ${text}`;
                                 setNewPromptText(p.prompt);
                                 setShowNewPromptForm(true);
                               }}
-                              className="px-1.5 py-0.5 text-stone-500 hover:text-stone-800"
+                              className="text-stone-400 hover:text-stone-700"
                             >
                               Edit
                             </button>
                             <button
                               onClick={() => deleteCustomPrompt(p.id)}
-                              className="px-1.5 py-0.5 text-red-500 hover:text-red-700"
+                              className="text-red-400 hover:text-red-600"
                             >
                               Delete
                             </button>
                           </div>
                         </div>
 
-                        <p className="line-clamp-2 text-[11px] text-stone-500">{p.prompt}</p>
-
-                        <button
-                          onClick={() => {
-                            applyCustomPrompt(p);
-                            setMobileMenuOpen(false);
-                          }}
-                          className={`mt-1 w-full rounded py-1 text-center text-xs font-medium ${
-                            isSelected
-                              ? "bg-orange-600 text-white"
-                              : "bg-stone-100 text-stone-700 hover:bg-orange-100"
-                          }`}
-                        >
-                          {isSelected ? "Currently Active (Run)" : "Apply Prompt"}
-                        </button>
+                        <p className="line-clamp-2 text-[11px] text-stone-500 pr-2">
+                          {p.prompt}
+                        </p>
                       </div>
                     );
                   })}
                 </div>
 
-                {/* Inline Add / Edit Form */}
+                {/* Inline Prompt Form */}
                 {showNewPromptForm && (
                   <div className="mt-3 space-y-2 rounded-lg border border-stone-200 bg-stone-50 p-3">
                     <span className="text-xs font-semibold text-stone-700">
@@ -1600,14 +1606,14 @@ ${text}`;
                     </span>
                     <input
                       type="text"
-                      placeholder="Title (e.g., Extract Dates)"
+                      placeholder="Title (e.g. Summary, Vocabulary)"
                       value={newPromptName}
                       onChange={(e) => setNewPromptName(e.target.value)}
                       className="w-full rounded border border-stone-200 bg-white p-1.5 text-xs outline-none focus:border-orange-500"
                     />
                     <textarea
                       rows={3}
-                      placeholder="Instructions (e.g., Provide bullet-point takeaways and vocabulary...)"
+                      placeholder="Prompt instructions..."
                       value={newPromptText}
                       onChange={(e) => setNewPromptText(e.target.value)}
                       className="w-full rounded border border-stone-200 bg-white p-1.5 text-xs outline-none focus:border-orange-500"
@@ -1631,7 +1637,7 @@ ${text}`;
                 )}
               </div>
 
-              {/* Delete Book Danger Zone */}
+              {/* Danger Zone */}
               <div className="pt-4 border-t border-stone-200">
                 <button
                   onClick={handleDeleteBookForever}
