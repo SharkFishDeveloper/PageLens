@@ -48,6 +48,13 @@ const OCR_LANGUAGE_OPTIONS: { label: string; value: "eng" | "ara" | "eng+ara" }[
 ];
 
 const CUSTOM_PROMPTS_STORAGE_KEY = "reader_custom_prompts";
+const DEFAULT_PROMPT_STORAGE_KEY = "reader_default_custom_prompt_id";
+
+// Languages whose script reads right-to-left. Direction for the generated
+// result is decided by the chosen output language (not by sniffing the
+// text), so a mostly-English translation that happens to quote a couple of
+// Arabic words doesn't get flipped to right-aligned.
+const RTL_OUTPUT_LANGUAGES = new Set(["Arabic", "Urdu"]);
 
 // Safety cap on the AI response size. A well-formed translation/explanation
 // of a single page should never come close to this — if it's exceeded it
@@ -82,12 +89,16 @@ const Book = () => {
   // "none" | "translation" | "explanation" | `custom:${promptId}`
   const [activeAITab, setActiveAITab] = useState<string>("none");
 
-  // Custom prompts (persisted to localStorage)
+  // Custom prompts (persisted to localStorage) — shown as an always-visible
+  // list above the book, each with Apply / Edit / Delete, plus one prompt
+  // that can be marked default so it's applied automatically on open.
   const [customPrompts, setCustomPrompts] = useState<CustomPrompt[]>([]);
-  const [showPromptManager, setShowPromptManager] = useState(false);
+  const [defaultPromptId, setDefaultPromptId] = useState<string | null>(null);
   const [showNewPromptForm, setShowNewPromptForm] = useState(false);
+  const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
   const [newPromptName, setNewPromptName] = useState("");
   const [newPromptText, setNewPromptText] = useState("");
+  const [makeDefaultOnSave, setMakeDefaultOnSave] = useState(false);
 
   // Reading experience states
   const [pdfVisible, setPdfVisible] = useState<boolean>(true);
@@ -136,7 +147,9 @@ const Book = () => {
   const mainScrollRef = useRef<HTMLElement | null>(null);
   const contentScrollRef = useRef<HTMLDivElement | null>(null);
   const pdfContainerRef = useRef<HTMLDivElement | null>(null);
-  const promptManagerRef = useRef<HTMLDivElement | null>(null);
+  // Guards against re-applying the default custom prompt more than once per
+  // book (it should auto-apply on open, not every time ocrText updates).
+  const defaultAppliedRef = useRef(false);
 
   // Runs a function after any currently-running OCR job finishes, and blocks
   // any later job until this one is done. This is what stops "switch language
@@ -196,20 +209,20 @@ const Book = () => {
     } catch (err) {
       console.warn("Could not load saved custom prompts", err);
     }
+
+    try {
+      const savedDefault = localStorage.getItem(DEFAULT_PROMPT_STORAGE_KEY);
+      if (savedDefault) setDefaultPromptId(savedDefault);
+    } catch (err) {
+      console.warn("Could not load default custom prompt", err);
+    }
   }, []);
 
-  // Close the custom-prompt dropdown when clicking outside it.
+  // Allow the default custom prompt to auto-apply again for a newly opened
+  // book (it should only skip re-applying within the *same* book session).
   useEffect(() => {
-    if (!showPromptManager) return;
-    const handleClick = (e: MouseEvent) => {
-      if (promptManagerRef.current && !promptManagerRef.current.contains(e.target as Node)) {
-        setShowPromptManager(false);
-        setShowNewPromptForm(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [showPromptManager]);
+    defaultAppliedRef.current = false;
+  }, [book?.name]);
 
   // Keep the PDF page's render width in sync with however much horizontal
   // space its container actually has — this is what makes the viewer usable
@@ -258,21 +271,80 @@ const Book = () => {
     }
   };
 
-  const addCustomPrompt = () => {
+  const persistDefaultPromptId = (id: string | null) => {
+    setDefaultPromptId(id);
+    try {
+      if (id) localStorage.setItem(DEFAULT_PROMPT_STORAGE_KEY, id);
+      else localStorage.removeItem(DEFAULT_PROMPT_STORAGE_KEY);
+    } catch (err) {
+      console.warn("Could not save default custom prompt", err);
+    }
+  };
+
+  const toggleDefaultPrompt = (id: string) => {
+    persistDefaultPromptId(defaultPromptId === id ? null : id);
+  };
+
+  // Runs a saved prompt against the current page. Also switches continuous
+  // mode on if it isn't already, so the same prompt keeps generating as the
+  // reader turns pages instead of needing to be re-applied on every page.
+  const applyCustomPrompt = (p: CustomPrompt) => {
+    activeCustomPromptTextRef.current = p.prompt;
+    if (!continuousMode) {
+      setContinuousMode(true);
+      try {
+        localStorage.setItem("reader_continuous_mode", "1");
+      } catch {}
+    }
+    handleAITask(`custom:${p.id}`, p.prompt);
+  };
+
+  const startEditPrompt = (p: CustomPrompt) => {
+    setEditingPromptId(p.id);
+    setNewPromptName(p.name);
+    setNewPromptText(p.prompt);
+    setMakeDefaultOnSave(defaultPromptId === p.id);
+    setShowNewPromptForm(true);
+  };
+
+  const cancelPromptForm = () => {
+    setShowNewPromptForm(false);
+    setEditingPromptId(null);
+    setNewPromptName("");
+    setNewPromptText("");
+    setMakeDefaultOnSave(false);
+  };
+
+  const savePromptForm = () => {
     const name = newPromptName.trim();
     const text = newPromptText.trim();
     if (!name || !text) return;
 
-    const newPrompt: CustomPrompt = {
-      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      name,
-      prompt: text,
-    };
+    let savedId = editingPromptId;
 
-    persistCustomPrompts([...customPrompts, newPrompt]);
-    setNewPromptName("");
-    setNewPromptText("");
-    setShowNewPromptForm(false);
+    if (editingPromptId) {
+      persistCustomPrompts(
+        customPrompts.map((p) => (p.id === editingPromptId ? { ...p, name, prompt: text } : p))
+      );
+    } else {
+      const newPrompt: CustomPrompt = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        prompt: text,
+      };
+      savedId = newPrompt.id;
+      persistCustomPrompts([...customPrompts, newPrompt]);
+    }
+
+    if (savedId) {
+      if (makeDefaultOnSave) {
+        persistDefaultPromptId(savedId);
+      } else if (defaultPromptId === savedId) {
+        persistDefaultPromptId(null);
+      }
+    }
+
+    cancelPromptForm();
   };
 
   const deleteCustomPrompt = (id: string) => {
@@ -281,6 +353,12 @@ const Book = () => {
       setActiveAITab("none");
       setResultText("");
       activeCustomPromptTextRef.current = "";
+    }
+    if (defaultPromptId === id) {
+      persistDefaultPromptId(null);
+    }
+    if (editingPromptId === id) {
+      cancelPromptForm();
     }
   };
 
@@ -1065,6 +1143,20 @@ ${text}`;
     );
   }, [continuousMode, currentPage, ocrText, activeAITab, outputLanguage, handleAITask]);
 
+  // Auto-apply the default custom prompt once per book, as soon as the first
+  // page's text is ready — so a default prompt means "just start reading"
+  // rather than needing to pick it again every time the book is opened.
+  useEffect(() => {
+    if (defaultAppliedRef.current) return;
+    if (!defaultPromptId || activeAITab !== "none" || !ocrText.trim()) return;
+
+    const defaultPrompt = customPrompts.find((p) => p.id === defaultPromptId);
+    if (!defaultPrompt) return;
+
+    defaultAppliedRef.current = true;
+    applyCustomPrompt(defaultPrompt);
+  }, [defaultPromptId, customPrompts, ocrText, activeAITab]);
+
   const handleDocumentLoad = (pdf: any) => {
     setNumPages(pdf.numPages);
     setPdfDocProxy(pdf);
@@ -1448,12 +1540,126 @@ ${text}`;
         )}
       </header>
 
+      {/* Custom prompts — always visible above the book, so applying, editing,
+          or deleting a saved prompt never requires digging through a menu.
+          One prompt can be marked default (★) to auto-apply on open. */}
+      <div className="z-10 flex-shrink-0 border-b border-orange-200 bg-orange-50/60 px-3 py-2 sm:px-4">
+        <div className="mx-auto max-w-6xl">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-semibold text-orange-800">Custom prompts</span>
+            {activeAITab.startsWith("custom:") && (
+              <span className="text-[10px] text-orange-600">Active: {getTaskLabel(activeAITab)}</span>
+            )}
+          </div>
+
+          {customPrompts.length === 0 && !showNewPromptForm && (
+            <p className="px-1 py-1 text-xs text-stone-400">No saved prompts yet — add one below.</p>
+          )}
+
+          {customPrompts.length > 0 && (
+            <div className="flex flex-col gap-1">
+              {customPrompts.map((p) => (
+                <div
+                  key={p.id}
+                  className={`flex items-center gap-1 rounded-lg px-2 py-1 ${
+                    activeAITab === `custom:${p.id}` ? "bg-orange-100" : "bg-white"
+                  }`}
+                >
+                  <button
+                    onClick={() => toggleDefaultPrompt(p.id)}
+                    title={defaultPromptId === p.id ? "Default prompt — click to unset" : "Set as default prompt"}
+                    className={`shrink-0 text-sm ${
+                      defaultPromptId === p.id ? "text-orange-600" : "text-stone-300 hover:text-orange-400"
+                    }`}
+                  >
+                    ★
+                  </button>
+                  <span
+                    className="flex-1 truncate text-xs font-medium text-stone-700"
+                    title={p.prompt}
+                  >
+                    {p.name}
+                  </span>
+                  <button
+                    onClick={() => applyCustomPrompt(p)}
+                    disabled={aiLoading || !ocrText}
+                    className="shrink-0 rounded-md bg-orange-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-orange-700 disabled:opacity-40"
+                  >
+                    Apply
+                  </button>
+                  <button
+                    onClick={() => startEditPrompt(p)}
+                    className="shrink-0 rounded-md bg-orange-50 px-2 py-0.5 text-[11px] font-medium text-orange-700 hover:bg-orange-100"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => deleteCustomPrompt(p.id)}
+                    className="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-red-500 hover:bg-red-50"
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {showNewPromptForm ? (
+            <div className="mt-2 space-y-1 border-t border-orange-100 pt-2">
+              <input
+                value={newPromptName}
+                onChange={(e) => setNewPromptName(e.target.value)}
+                placeholder="Prompt name"
+                className="w-full rounded-lg border border-orange-200 bg-white px-2 py-1 text-xs outline-none focus:border-orange-600"
+              />
+              <textarea
+                value={newPromptText}
+                onChange={(e) => setNewPromptText(e.target.value)}
+                placeholder="e.g. Summarize this page in 3 bullet points"
+                rows={3}
+                className="w-full rounded-lg border border-orange-200 bg-white px-2 py-1 text-xs outline-none focus:border-orange-600"
+              />
+              <label className="flex items-center gap-1.5 px-0.5 text-[11px] text-stone-500">
+                <input
+                  type="checkbox"
+                  checked={makeDefaultOnSave}
+                  onChange={(e) => setMakeDefaultOnSave(e.target.checked)}
+                />
+                Make this the default prompt (auto-applies when you open this book)
+              </label>
+              <div className="flex gap-1">
+                <button
+                  onClick={savePromptForm}
+                  disabled={!newPromptName.trim() || !newPromptText.trim()}
+                  className="flex-1 rounded-lg bg-orange-600 px-2 py-1 text-xs font-medium text-white hover:bg-orange-700 disabled:opacity-40"
+                >
+                  {editingPromptId ? "Save changes" : "Save"}
+                </button>
+                <button
+                  onClick={cancelPromptForm}
+                  className="flex-1 rounded-lg bg-orange-50 px-2 py-1 text-xs font-medium text-orange-800 hover:bg-orange-100"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setShowNewPromptForm(true)}
+              className="mt-1 w-full rounded-lg border border-dashed border-orange-300 px-2 py-1.5 text-xs font-medium text-orange-600 hover:bg-orange-50"
+            >
+              + New custom prompt
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Reading area — fills whatever space is left between header and nav.
           Only this region scrolls (and only if its content needs it); the
           header and bottom nav are always fully visible. */}
       <main
         ref={mainScrollRef as any}
-        className="mx-auto flex w-full min-h-0 max-w-4xl flex-1 flex-col overflow-y-auto px-3 pt-2 sm:px-4 sm:pt-3"
+        className="mx-auto flex w-full min-h-0 max-w-6xl flex-1 flex-col gap-3 overflow-y-auto px-3 pt-2 sm:px-4 sm:pt-3 md:flex-row md:overflow-hidden"
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
@@ -1462,7 +1668,7 @@ ${text}`;
             real chunk of the screen. Sits on top; the translation/explanation
             panel below is the "normal reader" split underneath it. */}
         {pdfVisible && (
-          <div className="mb-2 flex-shrink-0 sm:mb-3">
+          <div className="mb-2 flex-shrink-0 sm:mb-3 md:mb-0 md:flex md:h-full md:w-1/2 md:min-h-0 md:flex-shrink-0 md:flex-col">
             <div className="mb-1 flex items-center justify-between px-1">
               <span className="text-[11px] font-semibold text-orange-800">
                 Original page
@@ -1501,7 +1707,7 @@ ${text}`;
 
             <div
               ref={pdfContainerRef}
-              className="h-[40vh] w-full overflow-auto rounded-xl border border-orange-200 bg-white p-2 shadow-sm sm:h-[46vh]"
+              className="h-[40vh] w-full overflow-auto rounded-xl border border-orange-200 bg-white p-2 shadow-sm sm:h-[46vh] md:h-full md:flex-1"
             >
               <div className="flex min-h-full items-start justify-center">
                 <Document
@@ -1526,7 +1732,11 @@ ${text}`;
             reading surface. This flexes to fill the remaining height and
             only its inner text area scrolls, so the toolbar/tabs stay
             pinned in view. */}
-        <div className={`page-stage flex min-h-0 flex-1 flex-col pb-2 sm:pb-3 ${flipClass}`}>
+        <div
+          className={`page-stage flex min-h-0 flex-1 flex-col pb-2 sm:pb-3 md:h-full md:pb-0 ${
+            pdfVisible ? "md:w-1/2" : "md:w-full"
+          } ${flipClass}`}
+        >
           <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-orange-200 bg-white p-3 shadow-md sm:p-8">
             <div className="mb-2 flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-orange-100 pb-2 sm:mb-4 sm:pb-3">
               <button
@@ -1552,101 +1762,13 @@ ${text}`;
                 Explanation
               </button>
 
-              {/* Custom prompt picker: saved prompts loaded from & written to
-                  localStorage, with delete support. */}
-              <div className="relative" ref={promptManagerRef}>
-                <button
-                  onClick={() => setShowPromptManager((v) => !v)}
-                  disabled={aiLoading || !ocrText}
-                  className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 sm:px-3 sm:text-sm ${
-                    activeAITab.startsWith("custom:")
-                      ? "bg-orange-800 text-white shadow-sm"
-                      : "bg-orange-50 text-orange-800 hover:bg-orange-100"
-                  }`}
-                >
-                  {activeAITab.startsWith("custom:") ? `✨ ${getTaskLabel(activeAITab)}` : "✨ Custom"}
-                </button>
-
-                {showPromptManager && (
-                  <div className="absolute left-0 top-full z-40 mt-1 w-64 rounded-xl border border-orange-200 bg-white p-2 shadow-lg">
-                    {customPrompts.length === 0 && !showNewPromptForm && (
-                      <p className="px-1 py-2 text-xs text-stone-400">No saved prompts yet.</p>
-                    )}
-
-                    <div className="max-h-40 overflow-y-auto">
-                      {customPrompts.map((p) => (
-                        <div
-                          key={p.id}
-                          className="flex items-center gap-1 rounded-lg px-1 py-1 hover:bg-orange-50"
-                        >
-                          <button
-                            onClick={() => {
-                              activeCustomPromptTextRef.current = p.prompt;
-                              setShowPromptManager(false);
-                              handleAITask(`custom:${p.id}`, p.prompt);
-                            }}
-                            className="flex-1 truncate text-left text-xs font-medium text-stone-700"
-                            title={p.prompt}
-                          >
-                            {p.name}
-                          </button>
-                          <button
-                            onClick={() => deleteCustomPrompt(p.id)}
-                            className="rounded px-1.5 py-0.5 text-xs text-red-500 hover:bg-red-50"
-                            title="Delete this prompt"
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-
-                    {showNewPromptForm ? (
-                      <div className="mt-2 space-y-1 border-t border-orange-100 pt-2">
-                        <input
-                          value={newPromptName}
-                          onChange={(e) => setNewPromptName(e.target.value)}
-                          placeholder="Prompt name"
-                          className="w-full rounded-lg border border-orange-200 px-2 py-1 text-xs outline-none focus:border-orange-600"
-                        />
-                        <textarea
-                          value={newPromptText}
-                          onChange={(e) => setNewPromptText(e.target.value)}
-                          placeholder="e.g. Summarize this page in 3 bullet points"
-                          rows={3}
-                          className="w-full rounded-lg border border-orange-200 px-2 py-1 text-xs outline-none focus:border-orange-600"
-                        />
-                        <div className="flex gap-1">
-                          <button
-                            onClick={addCustomPrompt}
-                            disabled={!newPromptName.trim() || !newPromptText.trim()}
-                            className="flex-1 rounded-lg bg-orange-600 px-2 py-1 text-xs font-medium text-white hover:bg-orange-700 disabled:opacity-40"
-                          >
-                            Save
-                          </button>
-                          <button
-                            onClick={() => {
-                              setShowNewPromptForm(false);
-                              setNewPromptName("");
-                              setNewPromptText("");
-                            }}
-                            className="flex-1 rounded-lg bg-orange-50 px-2 py-1 text-xs font-medium text-orange-800 hover:bg-orange-100"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => setShowNewPromptForm(true)}
-                        className="mt-1 w-full rounded-lg border border-dashed border-orange-300 px-2 py-1.5 text-xs font-medium text-orange-600 hover:bg-orange-50"
-                      >
-                        + New custom prompt
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
+              {/* A saved prompt is applied from the "Custom prompts" panel
+                  above the book — this just reflects which one is active. */}
+              {activeAITab.startsWith("custom:") && (
+                <span className="rounded-lg bg-orange-800 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm sm:px-3 sm:text-sm">
+                  ✨ {getTaskLabel(activeAITab)}
+                </span>
+              )}
 
               <span className="ml-auto whitespace-nowrap rounded-full border border-orange-200 bg-orange-50 px-2 py-0.5 text-[10px] font-medium text-orange-700 sm:px-2.5 sm:text-xs">
                 {outputLanguage} · p.{currentPage}
@@ -1668,7 +1790,13 @@ ${text}`;
                 </p>
               ) : (
                 <p
-                  dir={detectDirection(resultText)}
+                  dir={
+                    outputLanguage === "Same as original"
+                      ? detectDirection(resultText)
+                      : RTL_OUTPUT_LANGUAGES.has(outputLanguage)
+                      ? "rtl"
+                      : "ltr"
+                  }
                   className="whitespace-pre-wrap break-words font-serif text-base leading-7 text-stone-800 sm:text-xl sm:leading-9"
                 >
                   {resultText || "Nothing generated for this page yet."}
