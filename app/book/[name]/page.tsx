@@ -1,6 +1,6 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { getDB } from "@/lib/idb";
 import { Book as BookType } from "@/interface";
@@ -55,9 +55,11 @@ const countWords = (str: string): number => {
 
 const Book = () => {
   const params = useParams();
+  const router = useRouter();
 
   const [book, setBook] = useState<BookType | null>(null);
   const [error, setError] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   // Extraction states
   const [selectedOcrLang, setSelectedOcrLang] = useState<"eng" | "ara" | "eng+ara">("ara");
@@ -318,7 +320,7 @@ const Book = () => {
     syncAICache();
   }, [currentPage, outputLanguage, book, getCachedAIData]);
 
-  // Page extraction (OCR / native text) cache — now backed by IndexedDB, with
+  // Page extraction (OCR / native text) cache — backed by IndexedDB, with
   // localStorage as a fallback if the "page_extractions" store isn't available.
   const getCacheKey = useCallback(
     (pageNum: number) =>
@@ -404,7 +406,14 @@ const Book = () => {
     const { createWorker, PSM } = await import("tesseract.js");
     const worker = await createWorker(selectedOcrLang.split("+"), 1, {
       workerPath: "/tesseract/worker.min.js",
-      corePath: "/tesseract",
+      // Force the plain SIMD build instead of letting tesseract.js
+      // auto-detect the browser's WASM feature set. Auto-detection was
+      // picking "relaxed SIMD" on some browsers/devices whose runtime
+      // claims to support the feature but doesn't actually implement every
+      // instruction it uses (e.g. DotProductSSE), which aborted mid-OCR
+      // with "missing function: _ZN9tesseract13DotProductSSEEPKfS1_i".
+      // Plain SIMD is far more consistently supported and still fast.
+      corePath: "/tesseract/tesseract-core-simd-lstm.js",
       langPath: "https://tessdata.projectnaptha.com/4.0.0_best",
       logger: () => {},
     });
@@ -515,7 +524,8 @@ const Book = () => {
         return await worker.recognize(offscreenCanvas, {}, { blocks: true });
       } catch (err) {
         // The worker may have been terminated by a concurrent language switch
-        // right before this ran. Recreate it once and retry rather than crash.
+        // right before this ran (or hit a bad core build). Recreate it once
+        // and retry rather than crash.
         console.warn("OCR worker call failed, recreating worker and retrying", err);
         tesseractWorkerRef.current = null;
         activeWorkerLangRef.current = "";
@@ -633,7 +643,9 @@ const Book = () => {
           }
         } catch (err) {
           console.error(err);
-          setOcrText("Could not extract text from this page.");
+          if (currentPageRef.current === pageToLoad) {
+            setOcrText("Could not extract text from this page.");
+          }
         } finally {
           if (currentPageRef.current === pageToLoad) {
             setOcrLoading(false);
@@ -963,6 +975,72 @@ ${requestText}`;
     else previousPage();
   };
 
+  // Deletes the book row itself plus every cached page-extraction and
+  // AI translation/explanation entry across all OCR languages and all
+  // output languages, then returns to the library. Uses book.numPages
+  // (persisted at add-time) rather than the in-memory numPages state so
+  // deletion is thorough even if the PDF hasn't finished loading yet.
+  const handleDeleteBookForever = useCallback(async () => {
+    if (!book || deleting) return;
+
+    const confirmed = window.confirm(
+      `Delete "${book.name}" permanently? This removes the file and all cached translations/explanations. This can't be undone.`
+    );
+    if (!confirmed) return;
+
+    setDeleting(true);
+    cancelOngoingAIRequest();
+
+    try {
+      const db = await getDB();
+
+      // Adjust this to match however "books" is actually keyed — e.g.
+      // book.id if it's an out-of-line key, or book.name if that's the
+      // inline keyPath used when the book was added.
+      const bookKey = (book as any).id ?? book.name;
+      await db.delete("books", bookKey);
+
+      const pagesToClean = Math.max(numPages, (book as any).numPages ?? 0, 1);
+
+      for (const ocrOpt of OCR_LANGUAGE_OPTIONS) {
+        for (let p = 1; p <= pagesToClean; p++) {
+          const extractionKey = `ocr_cache_${book.name}_${ocrOpt.value}_page_${p}`;
+          try {
+            if (db.objectStoreNames.contains("page_extractions")) {
+              await db.delete("page_extractions", extractionKey);
+            }
+          } catch (err) {
+            console.warn("IndexedDB delete failed (extraction) during book delete", err);
+          }
+          try {
+            localStorage.removeItem(extractionKey);
+          } catch {}
+
+          for (const lang of SUPPORTED_OUTPUT_LANGS) {
+            const aiKey = `page_ai_${book.name}_p${p}_${lang}_${ocrOpt.value}`;
+            try {
+              if (db.objectStoreNames.contains("ai_translations")) {
+                await db.delete("ai_translations", aiKey);
+              }
+            } catch (err) {
+              console.warn("IndexedDB delete failed (AI cache) during book delete", err);
+            }
+            try {
+              localStorage.removeItem(aiKey);
+            } catch {}
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Failed to delete book", err);
+      alert("Something went wrong deleting the book. Check the console.");
+      setDeleting(false);
+      return;
+    }
+
+    router.push("/");
+  }, [book, deleting, numPages, cancelOngoingAIRequest, router]);
+
   const Document = PDFComponents?.Document;
   const Page = PDFComponents?.Page;
 
@@ -1081,6 +1159,15 @@ ${requestText}`;
               title="Re-extract this page's text and clear any cached translation/explanation for it"
             >
               ↻
+            </button>
+
+            <button
+              onClick={handleDeleteBookForever}
+              disabled={deleting}
+              className="rounded-lg bg-red-50 px-3 py-1.5 text-sm font-medium text-red-600 shadow-sm hover:bg-red-100 disabled:opacity-50"
+              title="Delete this book and all its cached data permanently"
+            >
+              {deleting ? "Deleting…" : "🗑 Delete"}
             </button>
           </div>
         </div>
@@ -1246,9 +1333,6 @@ ${requestText}`;
           backface-visibility: hidden;
           will-change: transform;
         }
-        /* The page lifts and turns away (0 → 50%), the content underneath
-           swaps while it's edge-on, then it settles back down (50% → 100%),
-           revealing the next page — like an actual page turn. */
         @keyframes flipNext {
           0% {
             transform: rotateY(0deg) scale(1);
