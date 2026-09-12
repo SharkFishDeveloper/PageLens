@@ -19,13 +19,12 @@ const BookCard = ({
   setAllBooks,
 }: BookCardProps) => {
   const sizeInMB = (book.size / 1024 / 1024).toFixed(2);
-
   const title = book.name.replace(/\.pdf$/i, "");
 
   const [rename, setRename] = useState(false);
   const [renameText, setRenameText] = useState(title);
+  const [deleting, setDeleting] = useState(false);
 
-  // Load PDF components only in browser
   const [PDFComponents, setPDFComponents] = useState<{
     Document: any;
     Page: any;
@@ -52,7 +51,6 @@ const BookCard = ({
 
     if (!newName) return;
 
-    // Check duplicate name
     const alreadyExists = allBooks.some(
       (b) =>
         b.id !== book.id &&
@@ -65,17 +63,15 @@ const BookCard = ({
       return;
     }
 
-    // Create updated book
     const updatedBook: Book = {
       ...book,
       name: `${newName}.pdf`,
     };
 
-    // Update IndexedDB
     const db = await getDB();
+
     await db.put("books", updatedBook);
 
-    // Update Home state
     setAllBooks((books) =>
       books.map((b) =>
         b.id === book.id ? updatedBook : b
@@ -83,6 +79,31 @@ const BookCard = ({
     );
 
     setRename(false);
+  };
+
+  const handleDelete = async () => {
+    const confirmed = window.confirm(
+      `Delete "${title}"? This cannot be undone.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setDeleting(true);
+
+      const db = await getDB();
+
+      await db.delete("books", book.id);
+
+      setAllBooks((books) =>
+        books.filter((b) => b.id !== book.id)
+      );
+    } catch (error) {
+      console.error(error);
+      alert("Could not delete book");
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const Document = PDFComponents?.Document;
@@ -189,13 +210,15 @@ const BookCard = ({
 
         {/* ACTIONS */}
         <div className="mt-5 flex gap-2">
-          <button
+          <Link
+            href={`/book/${encodeURIComponent(book.name)}`}
             className="
               flex-1
               rounded-xl
               bg-gray-900
               px-4
               py-2.5
+              text-center
               text-sm
               font-medium
               text-white
@@ -203,31 +226,55 @@ const BookCard = ({
               hover:bg-gray-700
             "
           >
-            <Link href={`/book/${book.name}`}>Open Book</Link>
-          </button>
+            Open Book
+          </Link>
 
           {!rename && (
-            <button
-              onClick={() => setRename(true)}
-              className="
-                rounded-xl
-                border
-                border-gray-200
-                px-4
-                py-2.5
-                text-sm
-                font-medium
-                text-gray-600
-                hover:bg-gray-50
-              "
-            >
-              Rename
-            </button>
+            <>
+              <button
+                onClick={() => setRename(true)}
+                className="
+                  rounded-xl
+                  border
+                  border-gray-200
+                  px-4
+                  py-2.5
+                  text-sm
+                  font-medium
+                  text-gray-600
+                  hover:bg-gray-50
+                "
+                title="Rename book"
+              >
+                ✏️
+              </button>
+
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="
+                  rounded-xl
+                  border
+                  border-red-200
+                  px-4
+                  py-2.5
+                  text-sm
+                  text-red-500
+                  transition
+                  hover:bg-red-50
+                  disabled:opacity-50
+                "
+                title="Delete book"
+              >
+                {deleting ? "..." : "🗑️"}
+              </button>
+            </>
           )}
         </div>
 
         <p className="mt-4 text-xs text-gray-400">
-          Added {new Date(book.uploadedAt).toLocaleDateString()}
+          Added{" "}
+          {new Date(book.uploadedAt).toLocaleDateString()}
         </p>
       </div>
     </div>
