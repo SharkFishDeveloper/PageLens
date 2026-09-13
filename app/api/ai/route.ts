@@ -98,14 +98,16 @@ export async function POST(request: Request) {
     return NextResponse.json({
       text: outputText,
     });
-  } catch (error: any) {
-    console.error("Gemini AI Route Error:", error);
+  }catch (error: any) {
+  console.error("Gemini AI Route Error:", error);
 
-    return NextResponse.json(
-      {
-        error: error?.message || "Failed to generate AI response",
-      },
-      { status: 500 }
-    );
-  }
+  const status = error?.status || 500;
+
+  return NextResponse.json(
+    {
+      error: error?.message || "Failed to generate AI response",
+    },
+    { status }
+  );
+}
 }
