@@ -59,19 +59,14 @@ const BookOcrTextComponent = ({ book, pageNumber, lang, aiLang, pdfDoc, numPages
       setText(extractedText);
     };
     extractText();
-  }, [pdfDoc, pageNumber]);
+  }, [pdfDoc, pageNumber, allPageNo, lang]);
 
   return (
     <div className="h-full overflow-auto whitespace-pre-wrap p-6">
-      {text.map((t)=>t.text?.slice(0, 100))}
-      {" - left = "}
-      {left}
-      {" = right = "}
-      {right}
-      {" - "}
-      {pageNumber}
-      {" === "}
-      {numPages}
+      {text
+        .filter((m) => m.pageNumber === pageNumber)
+        .map((m) => m.text)
+        .join("\n")}
     </div>
   );
 };

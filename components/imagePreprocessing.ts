@@ -3,21 +3,17 @@ export type CanvasLike = HTMLCanvasElement | OffscreenCanvas;
 
 export interface ContrastConfig {
   enabled: boolean;
-  /** Lower percentile clipped to black (0-100). */
   lowPercentile: number;
-  /** Upper percentile clipped to white (0-100). */
   highPercentile: number;
 }
 
 export interface DenoiseConfig {
   enabled: boolean;
-  /** Median filter window. 3 = gentle (safe for diacritics), 5 = stronger. */
   kernelSize: 3 | 5;
 }
 
 export interface SharpenConfig {
   enabled: boolean;
-  /** Unsharp mask strength. 0.2-0.6 is "moderate". Higher risks halos/noise. */
   amount: number;
 }
 
@@ -26,17 +22,13 @@ export type BinarizeMethod = "none" | "sauvola" | "otsu";
 export interface BinarizeConfig {
   enabled: boolean;
   method: BinarizeMethod;
-  /** Sauvola local window size (odd number, e.g. 25-41). */
   windowSize?: number;
-  /** Sauvola sensitivity constant, typically 0.2-0.5. */
   k?: number;
 }
 
 export interface UpscaleConfig {
   enabled: boolean;
-  /** Target DPI to upscale toward, assuming a standard US-Letter/A4 page. */
   targetDpi: number;
-  /** Hard cap on the longest edge (pixels) to protect performance/memory. */
   maxDimensionPx: number;
 }
 
@@ -49,19 +41,6 @@ export interface OcrPreprocessConfig {
   binarize: BinarizeConfig;
 }
 
-// -----------------------------------------------------------------------
-// Recommended default configuration
-// -----------------------------------------------------------------------
-
-/**
- * Practical default for high-quality scanned book pages containing
- * Arabic and/or English text. Conservative on anything that can destroy
- * thin strokes/diacritics; binarization is off (Tesseract handles that
- * internally, generally better than a naive fixed threshold).
- *
- * Start here, then A/B test denoise.kernelSize, sharpen.amount, and
- * binarize.enabled against your real scans.
- */
 export const DEFAULT_ARABIC_ENGLISH_OCR_CONFIG: OcrPreprocessConfig = {
   upscale: {
     enabled: true,
@@ -75,11 +54,11 @@ export const DEFAULT_ARABIC_ENGLISH_OCR_CONFIG: OcrPreprocessConfig = {
     highPercentile: 99,
   },
   denoise: {
-    enabled: true,
+    enabled: false,
     kernelSize: 3,
   },
   sharpen: {
-    enabled: true,
+    enabled: false,
     amount: 0.4,
   },
   binarize: {
@@ -95,8 +74,6 @@ export const DEFAULT_ARABIC_ENGLISH_OCR_CONFIG: OcrPreprocessConfig = {
 // -----------------------------------------------------------------------
 
 /**
- * Runs the full preprocessing pipeline on a canvas and returns a NEW
- * canvas with the processed image. The input canvas is never mutated.
  *
  * @param sourceCanvas Canvas containing the rendered PDF page (e.g. from
  *                      PDF.js's `page.render()`).
@@ -305,7 +282,7 @@ function stretchContrastInPlace(
   cumulative = 0;
   for (let level = 255; level >= 0; level--) {
     cumulative += histogram[level];
-    if (cumulative >= totalPixels - highCount) {
+    if (cumulative >= cumulative - highCount) {
       whitePoint = level;
       break;
     }
