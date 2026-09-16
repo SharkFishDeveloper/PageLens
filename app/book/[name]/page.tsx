@@ -10,6 +10,7 @@ import {
   Panel,
   Separator,
 } from "react-resizable-panels";
+import BookOcrTextComponent from "@/components/BookOcrTextComponent";
 
 const SingleBook = () => {
 
@@ -18,9 +19,13 @@ const SingleBook = () => {
   const [book, setBook] = useState<Book | null>(null);
   const [openMenu, setOpenMenu] = useState(false);
 
+  const [lang, setLang] = useState("ara")
+  const [ailang, setAiLang] = useState("eng")
+
   const [prompt, setPrompt] = useState<Prompt | null>(null);
   const [showPdf, setShowPdf] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
+  const [pdfDoc, setPdfDoc] = useState<any>(null);
 
   const [pageNumber, setPageNumber] = useState(1);
   const [numPages, setNumPages] = useState(0);
@@ -94,9 +99,10 @@ const SingleBook = () => {
     async function getPageNumber() {
       if (!book) return;
       const pageNum = localStorage.getItem(`book-${book.name}`);
-      console.log("pageNum", pageNum)
-      const pageNumInt = pageNum ? parseInt(pageNum, 10) : 0;
+      const pageNumInt = pageNum ? parseInt(pageNum, 10) : 1;
+      console.log("pageNum", pageNumInt)
       setPageNumber(pageNumInt)
+      setPageInput(pageNumInt)
     }
     getPageNumber();
   }, [book])
@@ -106,18 +112,24 @@ const SingleBook = () => {
 
     const getPageCount = async () => {
       const url = URL.createObjectURL(book.file);
+
       try {
         const { pdfjs } = await import("react-pdf");
+
         pdfjs.GlobalWorkerOptions.workerSrc = new URL(
           "pdfjs-dist/build/pdf.worker.min.mjs",
           import.meta.url
         ).toString();
+
         const pdf = await pdfjs.getDocument(url).promise;
+
+        setPdfDoc(pdf);
         setNumPages(pdf.numPages);
       } finally {
         URL.revokeObjectURL(url);
       }
     };
+
     getPageCount();
   }, [book]);
 
@@ -246,14 +258,16 @@ const SingleBook = () => {
             </>
           )}
 
+          {/* Main Panel Component */}
           <Panel defaultSize="55" minSize="40">
             <div className="h-full overflow-auto bg-gray-400">
-              Right panel
+              <BookOcrTextComponent book={book} pageNumber={pageNumber} lang={lang} aiLang={ailang} pdfDoc={pdfDoc} numPages={numPages}/>
             </div>
           </Panel>
         </Group>
       </div>
 
+      {/* Footer */}
       <div className="flex shrink-0 items-center justify-center gap-1 border-t bg-white p-1 shadow-sm">
         <button
           onClick={() => {
