@@ -21,8 +21,6 @@ export type PagesProps = {
 
 const BookOcrTextComponent = ({ book, pageNumber, lang, aiLang, pdfDoc, numPages }: Prop) => {
   const [text, setText] = useState<PageTextResult[]>([]);
-  const [left, setLeft] = useState<number | null>(-1);
-  const [right, setRight] = useState<number | null>(-1);
   const [allPageNo, setAllPageNo] = useState<PagesProps>({
     currPageNo: pageNumber,
     prevCurrPageNo: null,

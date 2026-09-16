@@ -89,11 +89,11 @@ const BookCard = ({
     try {
       const db = await getDB();
 
-      if (!db.objectStoreNames.contains("ai_translations")) {
+      if (!db.objectStoreNames.contains("ai_task")) {
         return;
       }
 
-      const keys = await db.getAllKeys("ai_translations");
+      const keys = await db.getAllKeys("ai_task");
       const prefix = `page_ai_${book.name}_`;
 
       for (const key of keys) {
@@ -101,7 +101,7 @@ const BookCard = ({
           typeof key === "string" &&
           key.startsWith(prefix)
         ) {
-          await db.delete("ai_translations", key);
+          await db.delete("ai_task", key);
         }
       }
     } catch (error) {

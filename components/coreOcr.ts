@@ -1,124 +1,88 @@
-import { createWorker, Worker } from "tesseract.js";
+import { createWorker, PSM, Worker } from "tesseract.js";
 import { preprocessImageForOcr } from "./imagePreprocessing";
-import { arrangeOcrWords } from "@/lib/formatOcrText";
 
-let workerPromise: Promise<Worker> | null = null;
+const workerPool: Record<string, Promise<Worker>> = {};
 
-// Reuse a single worker across all pages.
-function getWorker(lang: string): Promise<Worker> {
-  if (!workerPromise) {
-    workerPromise = createWorker(lang, 1, {
-      workerPath: "/tesseract/worker.min.js",
-      corePath: "/tesseract/tesseract-core-simd.wasm.js",
-      langPath: "/tesseract/lang-data",
-    });
+function getWorker(lang: string = "ara"): Promise<Worker> {
+  if (!workerPool[lang]) {
+    workerPool[lang] = (async () => {
+      const worker = await createWorker(lang, 1, {
+        workerPath: "/tesseract/worker.min.js",
+        corePath: "/tesseract/tesseract-core-simd.wasm.js",
+        // CRITICAL: Ensure this points to tessdata_best/ara.traineddata
+        // Standard fast traineddata routinely fails on Arabic ligatures.
+        langPath: "/tesseract/lang-data",
+        gzip: false
+      });
+
+      // PSM 6 (Single uniform block of text) works best for scanned book pages
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+        preserve_interword_spaces: "1",
+      });
+
+      return worker;
+    })();
   }
-  return workerPromise;
+  return workerPool[lang];
 }
 
 export async function getOcrText(
   pdfDoc: any,
   pageNumber: number,
-  lang: string // e.g. "ara+eng", "ara", or "eng"
+  lang: string = "ara"
 ): Promise<string> {
-  // 1. Get the PDF page
   const page = await pdfDoc.getPage(pageNumber);
 
-  // 2. Create a high-resolution viewport
-  const viewport = page.getViewport({
-    scale: 3.0,
-  });
+  // 2.5 scale produces ~180-200 DPI from PDF standard 72 DPI, ideal for Tesseract
+  const viewport = page.getViewport({ scale: 3 });
 
-  // 3. Create an invisible canvas in memory
   const canvas = document.createElement("canvas");
-
   canvas.width = viewport.width;
   canvas.height = viewport.height;
 
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Could not create canvas context");
 
-  if (!ctx) {
-    throw new Error("Could not create canvas context");
-  }
+  await page.render({ canvasContext: ctx, viewport }).promise;
 
-  // 4. Render the PDF page onto the canvas
-  await page.render({
-    canvasContext: ctx,
-    viewport,
-  }).promise;
+  // Turn off Sauvola/Otsu binarization if it was enabled; 
+  // high-contrast grayscale gives Tesseract's internal Otsu much better dot/diacritic retention.
+  const processedCanvas = preprocessImageForOcr(canvas, {
+    upscale: { enabled: false, targetDpi: 300, maxDimensionPx: 4000 },
+    binarize: { enabled: false, method: "none" },
+    contrast: { enabled: true, lowPercentile: 2, highPercentile: 98 },
+  });
 
+  const worker = await getWorker(lang);
+  const { data } = await worker.recognize(
+    processedCanvas as HTMLCanvasElement,
+    {},
+    { blocks: true }
+  );
 
-
-// 6. Preprocess the image
-const processedCanvas = preprocessImageForOcr(canvas, {});
-// const processedCanvas = canvas;
-
-const worker = await getWorker(lang);
-
-const { data } = await worker.recognize(
-  processedCanvas as HTMLCanvasElement,
-  {},
-  { blocks: true }
-);
-
-// 11. Extract words from blocks
-const words: any[] = [];
-
-(data as any).blocks?.forEach((block: any) => {
-  block.paragraphs?.forEach((paragraph: any) => {
-    paragraph.lines?.forEach((line: any) => {
-      line.words?.forEach((word: any) => {
-        words.push(word);
+  // 11. Extract words from blocks
+  const words: any[] = [];
+  (data as any).blocks?.forEach((block: any) => {
+    block.paragraphs?.forEach((paragraph: any) => {
+      paragraph.lines?.forEach((line: any) => {
+        line.words?.forEach((word: any) => {
+          if (word.confidence >= 30) {
+            words.push(word);
+          }
+        });
       });
     });
   });
-});
-  // 10. Return extracted text
- const alignedText = arrangeOcrWords(words);
-  return alignedText;
+  // Return Tesseract's native BiDi layout engine output directly
+  return words.map((word) => word.text).join(" ");
 }
 
-// Call once after processing the entire book.
 export async function terminateOcrWorker(): Promise<void> {
-  if (workerPromise) {
-    const worker = await workerPromise;
-
+  const keys = Object.keys(workerPool);
+  for (const key of keys) {
+    const worker = await workerPool[key];
     await worker.terminate();
-
-    workerPromise = null;
+    delete workerPool[key];
   }
 }
-
-// 5. Display the original canvas
-// canvas.style.border = "2px solid red";
-// canvas.style.width = "300px";
-// canvas.style.height = "auto";
-// canvas.style.display = "block";
-// canvas.style.marginBottom = "10px";
-
-// document.body.appendChild(canvas);
-
-// // 7. Create a separate canvas for displaying the processed result
-// const displayCanvas = document.createElement("canvas");
-
-// displayCanvas.width = processedCanvas.width;
-// displayCanvas.height = processedCanvas.height;
-
-// const displayCtx = displayCanvas.getContext("2d");
-
-// if (!displayCtx) {
-//   throw new Error("Could not create display canvas context");
-// }
-
-// displayCtx.drawImage(processedCanvas, 0, 0);
-
-// // 8. Display the processed canvas
-// displayCanvas.style.border = "2px solid blue";
-// displayCanvas.style.width = "300px";
-// displayCanvas.style.height = "auto";
-// displayCanvas.style.display = "block";
-// displayCanvas.style.marginBottom = "20px";
-
-// document.body.appendChild(displayCanvas);
-
-// 9. Get the Tesseract worker

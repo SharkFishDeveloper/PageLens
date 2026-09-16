@@ -58,7 +58,7 @@ export const DEFAULT_ARABIC_ENGLISH_OCR_CONFIG: OcrPreprocessConfig = {
     kernelSize: 3,
   },
   sharpen: {
-    enabled: false,
+    enabled: true,
     amount: 0.4,
   },
   binarize: {
@@ -257,20 +257,20 @@ function stretchContrastInPlace(
   highPercentile: number
 ): void {
   const histogram = new Array(256).fill(0);
-  let totalPixels = 0;
+  const totalPixels = data.length / 4;
 
   for (let i = 0; i < data.length; i += 4) {
-    histogram[Math.round(data[i])]++; // channel already grayscale-equal
-    totalPixels++;
+    histogram[Math.round(data[i])]++;
   }
 
   const lowCount = totalPixels * (lowPercentile / 100);
-  const highCount = totalPixels * (highPercentile / 100);
+  const highCount = totalPixels * (1 - highPercentile / 100);
 
   let cumulative = 0;
   let blackPoint = 0;
   let whitePoint = 255;
 
+  // Find lower bound
   for (let level = 0; level < 256; level++) {
     cumulative += histogram[level];
     if (cumulative >= lowCount) {
@@ -279,16 +279,17 @@ function stretchContrastInPlace(
     }
   }
 
+  // Find upper bound (Fix: check against highCount)
   cumulative = 0;
   for (let level = 255; level >= 0; level--) {
     cumulative += histogram[level];
-    if (cumulative >= cumulative - highCount) {
+    if (cumulative >= highCount) {
       whitePoint = level;
       break;
     }
   }
 
-  if (whitePoint <= blackPoint) return; // degenerate page (e.g. blank); skip
+  if (whitePoint <= blackPoint) return;
 
   const range = whitePoint - blackPoint;
   for (let i = 0; i < data.length; i += 4) {

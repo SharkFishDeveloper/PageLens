@@ -1,5 +1,6 @@
 import { openDB, DBSchema, IDBPDatabase } from "idb";
 import { Book } from "@/interface";
+import { AITranslation, PageExtraction } from "@/types/db";
 
 interface BooksDBSchema extends DBSchema {
   books: {
@@ -8,11 +9,11 @@ interface BooksDBSchema extends DBSchema {
   };
   page_extractions: {
     key: string;
-    value: any;
+    value: PageExtraction;
   };
-  ai_translations: {
+  ai_task: {
     key: string;
-    value: any;
+    value: AITranslation;
   };
 }
 
@@ -32,8 +33,8 @@ export function getDB() {
           db.createObjectStore("page_extractions");
         }
         // Added in v2: per-page, per-language AI translation/explanation cache.
-        if (!db.objectStoreNames.contains("ai_translations")) {
-          db.createObjectStore("ai_translations");
+        if (!db.objectStoreNames.contains("ai_task")) {
+          db.createObjectStore("ai_task");
         }
       },
     });

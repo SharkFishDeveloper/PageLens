@@ -17,36 +17,49 @@ const detectDirection = (text: string): "rtl" | "ltr" => {
 export function arrangeOcrWords(words: OcrWord[]): string {
   if (!words || words.length === 0) return "";
 
-  // Remove empty words
-  const validWords = words.filter((word) => word.text.trim().length > 0);
+  const validWords = words.filter(
+    (word) => word.text.trim().length > 0
+  );
+
+  if (validWords.length === 0) return "";
 
   const combinedText = validWords.map((word) => word.text).join(" ");
   const direction = detectDirection(combinedText);
 
-  // Sort words from top to bottom
-  const sortedWords = [...validWords].sort(
-    (a, b) => a.bbox.y0 - b.bbox.y0
-  );
+  // Sort top-to-bottom using vertical center
+  const sortedWords = [...validWords].sort((a, b) => {
+    const aCenter = (a.bbox.y0 + a.bbox.y1) / 2;
+    const bCenter = (b.bbox.y0 + b.bbox.y1) / 2;
+    return aCenter - bCenter;
+  });
 
-  // Group words into lines based on their vertical position
   const lines: OcrWord[][] = [];
 
   for (const word of sortedWords) {
     const wordCenterY = (word.bbox.y0 + word.bbox.y1) / 2;
     const wordHeight = word.bbox.y1 - word.bbox.y0;
 
-    // Tolerance adapts to the word's height
-    const tolerance = Math.max(10, wordHeight * 0.5);
-
     let matchedLine: OcrWord[] | undefined;
 
     for (const line of lines) {
-      const firstWord = line[0];
+      const lineCenterY =
+        line.reduce(
+          (sum, w) => sum + (w.bbox.y0 + w.bbox.y1) / 2,
+          0
+        ) / line.length;
 
-      const firstCenterY =
-        (firstWord.bbox.y0 + firstWord.bbox.y1) / 2;
+      const averageHeight =
+        line.reduce(
+          (sum, w) => sum + (w.bbox.y1 - w.bbox.y0),
+          0
+        ) / line.length;
 
-      if (Math.abs(firstCenterY - wordCenterY) <= tolerance) {
+      const tolerance = Math.max(
+        5,
+        Math.min(wordHeight, averageHeight) * 0.5
+      );
+
+      if (Math.abs(lineCenterY - wordCenterY) <= tolerance) {
         matchedLine = line;
         break;
       }
@@ -59,24 +72,23 @@ export function arrangeOcrWords(words: OcrWord[]): string {
     }
   }
 
-  // Sort lines from top to bottom
+  // Top-to-bottom
   lines.sort((a, b) => {
-    const aY = Math.min(...a.map((word) => word.bbox.y0));
-    const bY = Math.min(...b.map((word) => word.bbox.y0));
-
+    const aY = Math.min(...a.map((w) => w.bbox.y0));
+    const bY = Math.min(...b.map((w) => w.bbox.y0));
     return aY - bY;
   });
 
-  // Arrange words within each line
-  const formattedLines = lines.map((line) => {
-    line.sort((a, b) => {
-      return direction === "rtl"
-        ? b.bbox.x0 - a.bbox.x0
-        : a.bbox.x0 - b.bbox.x0;
-    });
+  // Left-to-right or right-to-left
+  return lines
+    .map((line) => {
+      line.sort((a, b) =>
+        direction === "rtl"
+          ? b.bbox.x0 - a.bbox.x0
+          : a.bbox.x0 - b.bbox.x0
+      );
 
-    return line.map((word) => word.text.trim()).join(" ");
-  });
-
-  return formattedLines.join("\n");
+      return line.map((word) => word.text.trim()).join(" ");
+    })
+    .join("\n");
 }
